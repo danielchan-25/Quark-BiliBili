@@ -1,0 +1,38 @@
+.env
+.env.*
+!.env.example
+
+# Runtime data: accounts, browser/CDP configuration, comment history and databases
+data/*
+!data/.gitkeep
+!data/account.example.csv
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+
+# Generated reports and local service state
+outputs/
+logs/
+.quark-nd-disk/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node.js and editor files
+tools/node_modules/
+node_modules/
+npm-debug.log*
+.vscode/
+.idea/
+
+# Operating system files
+.DS_Store
+Thumbs.db
