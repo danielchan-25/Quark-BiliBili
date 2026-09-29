@@ -19,11 +19,16 @@ CREATE TABLE IF NOT EXISTS promotion_resources (
 CREATE TABLE IF NOT EXISTS promotion_candidates (
  id INTEGER PRIMARY KEY, resource_id INTEGER NOT NULL REFERENCES promotion_resources(id), platform TEXT NOT NULL, video_url TEXT NOT NULL,
  bvid TEXT NOT NULL, title TEXT, author TEXT, relevance TEXT, status TEXT NOT NULL DEFAULT 'archived', note TEXT,
+ ai_score REAL, ai_confidence REAL, ai_risk REAL, ai_status TEXT NOT NULL DEFAULT 'unreviewed',
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(resource_id, platform, video_url)
 );
 CREATE TABLE IF NOT EXISTS phrases (
  id INTEGER PRIMARY KEY, category TEXT NOT NULL, text TEXT NOT NULL UNIQUE, source TEXT NOT NULL, use_count INTEGER NOT NULL DEFAULT 0,
  last_used_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS promotion_reservations (
+ bvid TEXT PRIMARY KEY, text_key TEXT NOT NULL UNIQUE, account_id INTEGER NOT NULL,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS promotion_records (
  id INTEGER PRIMARY KEY, account_id INTEGER REFERENCES accounts(id), resource_id INTEGER REFERENCES promotion_resources(id),
@@ -84,6 +89,25 @@ class Database:
             self.connection.execute("UPDATE promotion_records SET target_id=bvid WHERE target_id IS NULL")
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_promotion_records_target ON promotion_records(account_id, platform, target_type, target_id)")
         self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(2)")
+        candidate_columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(promotion_candidates)")
+        }
+        for column, definition in (
+            ("ai_score", "REAL"),
+            ("ai_confidence", "REAL"),
+            ("ai_risk", "REAL"),
+            ("ai_status", "TEXT NOT NULL DEFAULT 'unreviewed'"),
+        ):
+            if column not in candidate_columns:
+                self.connection.execute(
+                    f"ALTER TABLE promotion_candidates ADD COLUMN {column} {definition}"
+                )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_promotion_candidates_ai "
+            "ON promotion_candidates(resource_id, platform, ai_status, ai_score DESC)"
+        )
+        self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(3)")
 
     def close(self) -> None:
         self.connection.close()

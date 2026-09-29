@@ -3,11 +3,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import random
+import sqlite3
 import sys
 from datetime import datetime, time, timedelta
 
 from mediaflow.bilibili import BilibiliClient, Candidate
+from mediaflow.candidate_screening import screen_candidate
 from mediaflow.account_csv import promotion_keywords, promotion_links
+from mediaflow.audit import write_audit_event
+from mediaflow.dedup import reserve, text_used
+from mediaflow.daily_review import daily_review
 from mediaflow.config import ROOT, Settings
 from mediaflow.database import Database
 from mediaflow.notify import FeishuNotifier
@@ -19,7 +24,7 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError):
         pass
 
-PROMOTION_SLOTS = ("00:05", "01:15", "05:06", "09:15", "10:07", "15:08", "17:15", "20:09")
+PROMOTION_SLOTS = ("00:05", "00:41", "01:15", "01:33", "05:06", "05:41", "06:33", "09:15", "10:07", "10:41", "11:33", "15:08", "15:41", "16:33", "17:15", "20:09", "20:41", "21:33")
 
 
 def account(db: Database, args: argparse.Namespace) -> int:
@@ -145,16 +150,21 @@ def render_phrase(text: str, category: str, url: str) -> str:
 def phrase(db: Database, category: str, url: str) -> tuple[str, str]:
     # Old archived phrases can retain obsolete share links. Only select a
     # phrase that uses the configured placeholder, or contains no URL at all.
-    row=db.connection.execute("""SELECT * FROM phrases
+    rows=db.connection.execute("""SELECT * FROM phrases
         WHERE category IN (?, '__DEFAULT__')
           AND (text LIKE '%{url}%' OR (text NOT LIKE '%http://%' AND text NOT LIKE '%https://%'))
-        ORDER BY last_used_at IS NOT NULL, last_used_at, use_count LIMIT 1""", (category,)).fetchone()
-    if row:
+        ORDER BY last_used_at IS NOT NULL, last_used_at, use_count""", (category,)).fetchall()
+    for row in rows:
         text=render_phrase(row["text"],category,url)
         if url not in text:
             text=f"{text.rstrip()}\n{url}"
+        if text_used(db, text):
+            continue
         db.connection.execute("UPDATE phrases SET use_count=use_count+1,last_used_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],)); db.connection.commit(); return text, row["source"]
-    return f"整理了一份 {category} 相关资料，有需要可以看看：\n{url}", "fallback_template"
+    text = f"整理了一份 {category} 相关资料，有需要可以看看：\n{url}"
+    if text_used(db, text):
+        raise ValueError('没有未使用的留言文案，请补充话术后再发布')
+    return text, "fallback_template"
 
 
 def detail_value(detail: str, key: str) -> str:
@@ -170,55 +180,117 @@ def available_candidate(db: Database, account_id: int, resource_id: int) -> Cand
            FROM promotion_candidates AS candidate
            WHERE candidate.resource_id=? AND candidate.platform='bilibili'
              AND candidate.status='available'
+             AND candidate.ai_status='approved'
              AND NOT EXISTS (
                  SELECT 1 FROM promotion_records AS record
-                 WHERE record.account_id=? AND record.video_url=candidate.video_url
+                 WHERE record.platform='bilibili' AND (record.bvid=candidate.bvid OR record.video_url=candidate.video_url)
              )
-           ORDER BY candidate.created_at DESC, candidate.id DESC
+             AND NOT EXISTS (SELECT 1 FROM promotion_reservations r WHERE r.bvid=candidate.bvid)
+           ORDER BY candidate.ai_score DESC, candidate.ai_confidence DESC, candidate.created_at DESC, candidate.id DESC
            LIMIT 1""",
-        (resource_id, account_id),
+        (resource_id,),
     ).fetchone()
     if not row:
         return None
     return Candidate(row["bvid"], row["video_url"], row["title"] or "", row["author"] or "")
 
 
-def refresh_promotion_candidates(db: Database, args: argparse.Namespace) -> int:
-    accounts = db.connection.execute(
-        "SELECT * FROM accounts WHERE role='promotion' AND platform='bilibili' AND enabled=1 ORDER BY id"
-    ).fetchall()
-    resources = db.connection.execute(
-        "SELECT id FROM promotion_resources WHERE enabled=1 ORDER BY id"
-    ).fetchall()
-    added = refreshed = 0
-    for acc in accounts:
-        keywords = promotion_keywords(ROOT / "data" / "account.csv", acc["name"])
-        with BilibiliClient(acc["cdp_url"]) as client:
-            if client.uid() != acc["uid"]:
-                raise RuntimeError(f"CDP profile UID does not match the configured account: {acc['name']}")
-            for keyword in keywords:
-                for candidate in client.search(keyword):
-                    for resource in resources:
-                        existed = db.connection.execute(
-                            "SELECT 1 FROM promotion_candidates WHERE resource_id=? AND platform='bilibili' AND video_url=?",
-                            (resource["id"], candidate.url),
-                        ).fetchone()
-                        db.connection.execute(
-                            """INSERT INTO promotion_candidates(
-                                resource_id, platform, video_url, bvid, title, author, relevance, status, note, created_at
-                            ) VALUES(?, 'bilibili', ?, ?, ?, ?, ?, 'available', ?, CURRENT_TIMESTAMP)
-                            ON CONFLICT(resource_id, platform, video_url) DO UPDATE SET
-                                bvid=excluded.bvid, title=excluded.title, author=excluded.author,
-                                relevance=excluded.relevance, status='available', note=excluded.note,
-                                created_at=CURRENT_TIMESTAMP""",
-                            (resource["id"], candidate.url, candidate.bvid, candidate.title, candidate.author, keyword, f"refreshed_by={acc['name']}"),
-                        )
-                        if existed:
-                            refreshed += 1
-                        else:
-                            added += 1
+def available_visible_candidate(db: Database, client: BilibiliClient, account_id: int, resource_id: int) -> Candidate | None:
+    candidate = available_candidate(db, account_id, resource_id)
+    while candidate and not client.video_visible(candidate.bvid):
+        db.connection.execute(
+            "UPDATE promotion_candidates SET status='unavailable' WHERE resource_id=? AND platform='bilibili' AND bvid=?",
+            (resource_id, candidate.bvid),
+        )
         db.connection.commit()
-    print(f"promotion candidates refreshed: added={added} refreshed={refreshed}")
+        candidate = available_candidate(db, account_id, resource_id)
+    return candidate
+
+
+def refresh_promotion_candidates(db: Database, args: argparse.Namespace) -> int:
+    settings = Settings.load()
+    audit_log = settings.log_dir / "promotion-candidates.jsonl"
+    if args.account:
+        accounts = [selected_account(db, args.account, "promotion")]
+        if accounts[0]["platform"] != "bilibili":
+            raise RuntimeError(f"not a BiliBili account: {args.account}")
+    else:
+        accounts = db.connection.execute(
+            "SELECT * FROM accounts WHERE role='promotion' AND platform='bilibili' AND enabled=1 ORDER BY id"
+        ).fetchall()
+    resources = db.connection.execute(
+        "SELECT id,category FROM promotion_resources WHERE enabled=1 ORDER BY id"
+    ).fetchall()
+    added = refreshed = approved = rejected = 0
+    write_audit_event(audit_log, "candidate_refresh_started", accounts=len(accounts), resources=len(resources))
+    try:
+        for acc in accounts:
+            keywords = promotion_keywords(ROOT / "data" / "account.csv", acc["name"])
+            write_audit_event(audit_log, "account_refresh_started", account=acc["name"], keywords=keywords)
+            with BilibiliClient(acc["cdp_url"]) as client:
+                if client.uid() != acc["uid"]:
+                    raise RuntimeError(f"CDP profile UID does not match the configured account: {acc['name']}")
+                write_audit_event(audit_log, "account_verified", account=acc["name"])
+                for keyword in keywords:
+                    for candidate in client.search(keyword):
+                        for resource in resources:
+                            screening = screen_candidate(
+                                api_key=settings.typesafe_api_key,
+                                keyword=keyword,
+                                resource_category=resource["category"],
+                                title=candidate.title,
+                                author=candidate.author,
+                            )
+                            existed = db.connection.execute(
+                                "SELECT 1 FROM promotion_candidates WHERE resource_id=? AND platform='bilibili' AND video_url=?",
+                                (resource["id"], candidate.url),
+                            ).fetchone()
+                            db.connection.execute(
+                                """INSERT INTO promotion_candidates(
+                                    resource_id, platform, video_url, bvid, title, author, relevance, status, note,
+                                    ai_score, ai_confidence, ai_risk, ai_status, created_at
+                                ) VALUES(?, 'bilibili', ?, ?, ?, ?, ?, 'available', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                ON CONFLICT(resource_id, platform, video_url) DO UPDATE SET
+                                    bvid=excluded.bvid, title=excluded.title, author=excluded.author,
+                                    relevance=excluded.relevance, status='available', note=excluded.note,
+                                    ai_score=excluded.ai_score, ai_confidence=excluded.ai_confidence,
+                                    ai_risk=excluded.ai_risk, ai_status=excluded.ai_status,
+                                    created_at=CURRENT_TIMESTAMP""",
+                                (
+                                    resource["id"], candidate.url, candidate.bvid, candidate.title, candidate.author,
+                                    keyword, f"refreshed_by={acc['name']}", screening.relevance_score,
+                                    screening.confidence, screening.risk_probability, screening.status,
+                                ),
+                            )
+                            write_audit_event(
+                                audit_log,
+                                "candidate_screened",
+                                account=acc["name"], keyword=keyword, resource_id=resource["id"],
+                                resource_category=resource["category"], bvid=candidate.bvid,
+                                video_url=candidate.url, title=candidate.title, author=candidate.author,
+                                existed=bool(existed), relevance_score=screening.relevance_score,
+                                confidence=screening.confidence, risk_probability=screening.risk_probability,
+                                status=screening.status,
+                            )
+                            if screening.status == "approved":
+                                approved += 1
+                            else:
+                                rejected += 1
+                            if existed:
+                                refreshed += 1
+                            else:
+                                added += 1
+            db.connection.commit()
+    except Exception as exc:
+        db.connection.rollback()
+        write_audit_event(audit_log, "candidate_refresh_failed", error_type=type(exc).__name__, error=str(exc))
+        raise
+    write_audit_event(
+        audit_log,
+        "candidate_refresh_completed",
+        added=added, refreshed=refreshed, approved=approved, rejected=rejected,
+    )
+    print(f"promotion candidates refreshed: added={added} refreshed={refreshed} approved={approved} rejected={rejected}")
     return 0
 
 
@@ -238,17 +310,18 @@ def promotion_summary(db: Database, notify: FeishuNotifier, args: argparse.Names
            ORDER BY tr.started_at, tr.id""",
         (utc_start.strftime("%Y-%m-%d %H:%M:%S"), utc_end.strftime("%Y-%m-%d %H:%M:%S")),
     ).fetchall()
-    labels = {"SUCCESS": "成功", "FAILED": "失败", "PENDING": "待复核", "SKIPPED": "跳过"}
+    labels = {"SUCCESS": "成功"}
     successes = sum(row["status"] == "SUCCESS" for row in rows)
-    failures = sum(row["status"] == "FAILED" for row in rows)
+    failures = len(rows) - successes
     lines = ["【MediaProject】【推广】", ""]
     for row in rows:
         detail = row["detail"] or ""
-        slot = detail_value(detail, "slot") or str(row["started_at"])[11:16]
+        slot = detail_value(detail, "slot") or (datetime.fromisoformat(row['started_at']) + timedelta(hours=8)).strftime('%H:%M')
         platform = {"bilibili": "BiliBili", "toutiao": "今日头条"}.get(row["platform"], row["platform"])
-        line = f"- {slot}: 平台={platform}, 账户={row['name']}, {labels.get(row['status'], row['status'])}"
+        line = f"- {slot}: 平台={platform}, 账户={row['name']}, {labels.get(row['status'], '失败')}"
         reason = detail_value(detail, "reason")
-        if row["status"] == "FAILED" and reason:
+        if row['status'] != 'SUCCESS':
+            reason = reason or {'RUNNING': '任务未正常结束，结果待核查', 'PENDING': '提交待复核，禁止自动重发', 'SKIPPED': '未执行发布'}.get(row['status'], '未完成发布')
             line += f"，失败原因：{reason}"
         lines.append(line)
     lines.extend(["", f"今日汇总: 成功{successes}, 失败{failures}", "推广链接：", ""])
@@ -260,17 +333,46 @@ def promotion_summary(db: Database, notify: FeishuNotifier, args: argparse.Names
 
 
 def promotion(db: Database, notify: FeishuNotifier, args: argparse.Namespace) -> int:
-    acc=selected_account(db,args.account,"promotion")
-    run_id = db.connection.execute("INSERT INTO task_runs(account_id,task_type,status,detail) VALUES(?,?,?,?)", (acc["id"],"promotion","RUNNING",f"slot={args.slot or ''}")).lastrowid
+    acc = selected_account(db, args.account, 'promotion')
+    # Fail closed even if the process is killed before Python can run finally.
+    run_id = db.connection.execute("INSERT INTO task_runs(account_id,task_type,status,detail) VALUES(?,'promotion','FAILED',?)", (acc['id'], f'slot={args.slot or ""}; reason=任务未完成，结果待核查')).lastrowid
     db.connection.commit()
+    try:
+        return _promotion(db, notify, args, run_id)
+    except BaseException as exc:
+        db.connection.rollback()
+        db.connection.execute("UPDATE task_runs SET status='FAILED',detail=? WHERE id=?", (f'slot={args.slot or ""}; reason={type(exc).__name__}: {str(exc)[:1000]}', run_id))
+        db.connection.commit()
+        raise
+    finally:
+        db.connection.execute('UPDATE task_runs SET ended_at=CURRENT_TIMESTAMP WHERE id=? AND ended_at IS NULL', (run_id,))
+        db.connection.commit()
+
+        result = db.connection.execute('SELECT status,detail,started_at FROM task_runs WHERE id=?', (run_id,)).fetchone()
+        if result['status'] != 'SUCCESS' and not getattr(args, 'dry_run', False) and notify is not None:
+            try:
+                if not notify.webhook:
+                    raise RuntimeError('FEISHU_WEBHOOK not configured')
+                clock = (datetime.fromisoformat(result['started_at']) + timedelta(hours=8)).strftime('%H:%M')
+                reason = (detail_value(result['detail'] or '', 'reason') or result['detail'] or '发布未完成').replace('\r', ' ').replace('\n', ' ')
+                notify.send_text(f"【Quark-BiliBili】\n\n- {clock}: 平台=BiliBili, 账户={acc['name']}, 失败，原因={reason}")
+                write_audit_event(ROOT/'logs/promotion-alerts.jsonl','alert_sent',run_id=run_id,account=acc['name'])
+            except Exception as alert_error:
+                write_audit_event(ROOT/'logs/promotion-alerts.jsonl','alert_failed',run_id=run_id,account=acc['name'],error_type=type(alert_error).__name__)
+                print(f'ALERT FAILED: {type(alert_error).__name__}; see logs/promotion-alerts.jsonl',file=sys.stderr)
+
+
+def _promotion(db: Database, notify: FeishuNotifier, args: argparse.Namespace, run_id: int) -> int:
+    acc=selected_account(db,args.account,"promotion")
     def finish(status: str, reason: str = "", video_url: str = "") -> None:
-        db.connection.execute("UPDATE task_runs SET status=?,detail=detail || ?,ended_at=CURRENT_TIMESTAMP WHERE id=?", (status, f"; reason={reason}; url={video_url}", run_id))
+        status = 'SUCCESS' if status == 'SUCCESS' else 'FAILED'
+        db.connection.execute("UPDATE task_runs SET status=?,detail=?,ended_at=CURRENT_TIMESTAMP WHERE id=?", (status, f"slot={args.slot or ''}; reason={reason}; url={video_url}", run_id))
         db.connection.commit()
     if not acc["uid"]: raise RuntimeError("run account check after manually logging in before promotion")
     ready, detail=rate_ready(db,acc["id"])
     if not ready:
         finish("SKIPPED",detail)
-        print(detail); return 0
+        print(detail); return 1
     resources=db.connection.execute("SELECT * FROM promotion_resources WHERE enabled=1 ORDER BY id").fetchall()
     keywords = promotion_keywords(ROOT / "data" / "account.csv", acc["name"])
     successes=failures=pending=skips=0
@@ -283,8 +385,8 @@ def promotion(db: Database, notify: FeishuNotifier, args: argparse.Namespace) ->
             if successes + failures + pending >= args.max_comments: break
             keyword=random.choice(keywords)
             # Candidates are collected once daily before promotion begins.
-            # They remain reusable across accounts but never twice by one account.
-            candidate=available_candidate(db, acc["id"], resource["id"])
+            # Videos and comment bodies are globally deduplicated across accounts.
+            candidate=available_visible_candidate(db, client, acc["id"], resource["id"])
             if not candidate:
                 failures += 1
                 failure_reasons.append(f"候选池为空（关键词={keyword}）")
@@ -304,7 +406,14 @@ def promotion(db: Database, notify: FeishuNotifier, args: argparse.Namespace) ->
                 # Do not mutate phrase usage, promotion history, candidates, or remote state.
                 finish("SKIPPED", "dry-run", candidate.url)
                 return 0
-            text,source=phrase(db,resource["category"],resource["url"])
+            try:
+                text,source=phrase(db,resource["category"],resource["url"])
+                reserve(db, candidate, text, acc['id'])
+            except (ValueError, sqlite3.IntegrityError) as exc:
+                skips += 1
+                failure_reasons.append(str(exc))
+                write_audit_event(ROOT / 'logs' / 'promotion-dedup.jsonl', 'dedup_skipped', account=acc['name'], bvid=candidate.bvid, reason=str(exc))
+                continue
             digest=hashlib.sha256(text.encode()).hexdigest()
             try:
                 submission=client.publish_comment(candidate.url,text)
@@ -331,7 +440,7 @@ def promotion(db: Database, notify: FeishuNotifier, args: argparse.Namespace) ->
     final_reason = "" if final_status == "SUCCESS" else ("评论提交待复核" if final_status == "PENDING" else "；".join(failure_reasons) or "没有可用候选或发布失败")
     latest_url = candidate.url if 'candidate' in locals() and candidate else ""
     finish(final_status,final_reason,latest_url)
-    print(f"promotion complete: success={successes} pending={pending} failed={failures} skipped={skips}"); return 0
+    print(f"promotion complete: success={successes} pending={pending} failed={failures} skipped={skips}"); return 0 if final_status == 'SUCCESS' else 1
 
 
 def nurture(db: Database, notify: FeishuNotifier, args: argparse.Namespace) -> int:
@@ -372,7 +481,7 @@ def main() -> int:
     tt_record=tt_sub.add_parser("record"); tt_record.add_argument("--account",required=True); tt_record.add_argument("--article-url",required=True); tt_record.add_argument("--text",required=True); tt_record.add_argument("--status",choices=("published","submitted","failed"),default="published"); tt_record.add_argument("--verification",choices=("verified","ui_confirmed","pending","not_run"),default="verified"); tt_record.add_argument("--detail"); tt_record.add_argument("--published-at")
     tt_list=tt_sub.add_parser("list"); tt_list.add_argument("--account",required=True)
     pr=sub.add_parser("promotion"); pr.add_argument("--account",required=True); pr.add_argument("--max-comments",type=int,default=1); pr.add_argument("--dry-run",action="store_true"); pr.add_argument("--slot",choices=PROMOTION_SLOTS)
-    sub.add_parser("promotion-candidates")
+    pc=sub.add_parser("promotion-candidates"); pc.add_argument("--account",help="refresh one enabled BiliBili promotion account")
     ps=sub.add_parser("promotion-summary"); ps.add_argument("--date", help="YYYY-MM-DD; defaults to today")
     n=sub.add_parser("nurture"); n.add_argument("--account",required=True); n.add_argument("--max-videos",type=int,default=5)
     args=p.parse_args(); settings=Settings.load(); db=Database(settings.database_path); notify=FeishuNotifier(settings.feishu_webhook,settings.feishu_secret)
@@ -383,7 +492,7 @@ def main() -> int:
         if args.command=="toutiao": return toutiao(db,args)
         if args.command=="promotion": return promotion(db,notify,args)
         if args.command=="promotion-candidates": return refresh_promotion_candidates(db,args)
-        if args.command=="promotion-summary": return promotion_summary(db,notify,args)
+        if args.command=="promotion-summary": return daily_review(db,notify,args)
         return nurture(db,notify,args)
     finally: db.close()
 

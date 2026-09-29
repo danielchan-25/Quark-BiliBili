@@ -18,6 +18,7 @@ class Settings:
     ai_api_url: str | None
     ai_api_key: str | None
     ai_model: str | None
+    typesafe_api_key: str | None
 
     @classmethod
     def load(cls) -> "Settings":
@@ -30,4 +31,5 @@ class Settings:
             ai_api_url=os.getenv("AI_API_URL") or None,
             ai_api_key=os.getenv("AI_API_KEY") or None,
             ai_model=os.getenv("AI_MODEL") or None,
+            typesafe_api_key=os.getenv("TYPESAFE_API_KEY") or None,
         )

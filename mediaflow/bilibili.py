@@ -5,13 +5,108 @@ import json
 import random
 import re
 import time
+from uuid import uuid4
 from dataclasses import dataclass
 from urllib.parse import quote, urlparse
+from urllib.request import build_opener, ProxyHandler
+from websocket import WebSocketTimeoutException, create_connection
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
+from mediaflow.audit import write_audit_event
+from mediaflow.config import ROOT
+
 
 _BVID = re.compile(r"/video/(BV[\w]+)")
+
+
+def _cdp_command(endpoint: str, method: str, params: dict[str, object] | None = None, timeout: float = 2) -> dict:
+    """Send one CDP command without attaching Playwright to every open tab."""
+    socket = create_connection(endpoint, timeout=timeout, suppress_origin=True)
+    try:
+        socket.send(json.dumps({"id": 1, "method": method, "params": params or {}}))
+        deadline = time.monotonic() + timeout
+        while True:
+            socket.settimeout(max(0.001, deadline - time.monotonic()))
+            response = json.loads(socket.recv())
+            if response.get("id") == 1:
+                if "error" in response:
+                    raise RuntimeError(f"CDP {method} failed: {response['error']}")
+                return response.get("result", {})
+    finally:
+        socket.close()
+
+
+def _recover_stalled_profile_info_tab(base_url: str, browser_endpoint: str) -> bool:
+    """Replace only an unresponsive, read-only ChromeManager information tab."""
+    opener = build_opener(ProxyHandler({}))
+    with opener.open(base_url + "/json/list", timeout=5) as response:
+        targets = json.load(response)
+    for target in targets:
+        page_url = target.get("url", "")
+        page = urlparse(page_url)
+        if (target.get("type") != "page" or "ChromeManager" not in target.get("title", "")
+                or page.hostname not in ("127.0.0.1", "localhost", "::1")
+                or not page.path.startswith("/profiles/") or not target.get("webSocketDebuggerUrl")):
+            continue
+        try:
+            _cdp_command(target["webSocketDebuggerUrl"], "Page.getFrameTree")
+        except WebSocketTimeoutException:
+            # Create the replacement first so a failed recovery keeps the old tab.
+            created = _cdp_command(browser_endpoint, "Target.createTarget", {"url": page_url, "background": True})
+            if not created.get("targetId"):
+                raise RuntimeError("CDP did not create the replacement Profile information tab")
+            closed = _cdp_command(browser_endpoint, "Target.closeTarget", {"targetId": target["id"]})
+            if not closed.get("success"):
+                raise RuntimeError("CDP did not close the stalled Profile information tab")
+            return True
+    return False
+
+
+def _scroll_to_comment_section(page: Page) -> None:
+    """Wait for Bilibili's asynchronously injected comment root before scrolling."""
+    selector = "#commentapp, bili-comments"
+    root = page.locator(selector).first
+    for attempt in range(2):
+        if attempt:
+            # No editor interaction or submission has happened yet, so a single
+            # page reload is safe recovery from a transient component failure.
+            page.reload(wait_until="domcontentloaded", timeout=30_000)
+        try:
+            root.wait_for(state="attached", timeout=15_000)
+        except PlaywrightTimeoutError:
+            if attempt == 0:
+                # The component can be deferred until its region approaches the
+                # viewport. Wake lazy content, then allow the DOM another chance.
+                page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
+                try:
+                    root.wait_for(state="attached", timeout=8_000)
+                except PlaywrightTimeoutError:
+                    continue
+            else:
+                state = page.evaluate("""() => ({
+                  readyState: document.readyState,
+                  hasCommentApp: !!document.querySelector('#commentapp'),
+                  hasBiliComments: !!document.querySelector('bili-comments'),
+                  hasVideoPlayer: !!document.querySelector('.bpx-player-container'),
+                  url: location.href
+                })""")
+                raise RuntimeError(f"Bilibili comment section did not render after one safe reload: {state}")
+        try:
+            root.scroll_into_view_if_needed(timeout=10_000)
+            return
+        except PlaywrightTimeoutError:
+            if attempt:
+                raise RuntimeError("Bilibili comment section appeared but could not be brought into view after one safe reload")
+
+    state = page.evaluate("""() => ({
+      readyState: document.readyState,
+      hasCommentApp: !!document.querySelector('#commentapp'),
+      hasBiliComments: !!document.querySelector('bili-comments'),
+      hasVideoPlayer: !!document.querySelector('.bpx-player-container'),
+      url: location.href
+    })""")
+    raise RuntimeError(f"Bilibili comment section did not render after wait and lazy-load wakeup: {state}")
 
 
 @dataclass(frozen=True)
@@ -31,29 +126,101 @@ class BilibiliClient:
         self.context: BrowserContext | None = None
 
     def __enter__(self) -> "BilibiliClient":
-        self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.connect_over_cdp(self.cdp_url, timeout=30_000)
-        if not self._browser.contexts:
-            raise RuntimeError("CDP browser has no available context")
-        self.context = self._browser.contexts[0]
-        return self
+        endpoint = self.cdp_url
+        parsed = urlparse(endpoint)
+        connection_id = uuid4().hex
+        target = f"{parsed.hostname}:{parsed.port}" if parsed.hostname else parsed.scheme
+        log_path = ROOT / "logs" / "cdp-connections.jsonl"
+        started = phase_started = time.perf_counter()
+        phase = "discovery"
+
+        def log(event: str, **fields: object) -> None:
+            write_audit_event(log_path, event, connection_id=connection_id, target=target, **fields)
+
+        try:
+            if parsed.scheme in ('http', 'https') and parsed.hostname in ('127.0.0.1', 'localhost', '::1'):
+                # Resolve local DevTools directly, never through HTTP_PROXY.
+                log("cdp_phase_started", phase=phase, timeout_ms=5_000)
+                try:
+                    with build_opener(ProxyHandler({})).open(endpoint + '/json/version', timeout=5) as response:
+                        endpoint = json.load(response)['webSocketDebuggerUrl']
+                    ws = urlparse(endpoint)
+                    if ws.scheme not in ('ws', 'wss') or ws.hostname not in ('127.0.0.1', 'localhost', '::1'):
+                        raise ValueError('DevTools did not return a loopback WebSocket endpoint')
+                except Exception as exc:
+                    raise RuntimeError(f'本地 CDP 服务不可用：{self.cdp_url}；请检查浏览器配置是否已启动（{type(exc).__name__}）') from exc
+                log("cdp_phase_completed", phase=phase, elapsed_ms=round((time.perf_counter() - phase_started) * 1000))
+                phase = "profile_info_preflight"
+                phase_started = time.perf_counter()
+                log("cdp_phase_started", phase=phase)
+                if _recover_stalled_profile_info_tab(self.cdp_url, endpoint):
+                    log("cdp_profile_info_recovered")
+                log("cdp_phase_completed", phase=phase, elapsed_ms=round((time.perf_counter() - phase_started) * 1000))
+            phase = "playwright_start"
+            phase_started = time.perf_counter()
+            log("cdp_phase_started", phase=phase)
+            self._pw = sync_playwright().start()
+            log("cdp_phase_completed", phase=phase, elapsed_ms=round((time.perf_counter() - phase_started) * 1000))
+            phase = "connect_over_cdp"
+            phase_started = time.perf_counter()
+            log("cdp_phase_started", phase=phase, timeout_ms=60_000)
+            self._browser = self._pw.chromium.connect_over_cdp(endpoint, timeout=60_000)
+            log("cdp_phase_completed", phase=phase, elapsed_ms=round((time.perf_counter() - phase_started) * 1000))
+            phase = "context_selection"
+            phase_started = time.perf_counter()
+            log("cdp_phase_started", phase=phase)
+            if not self._browser.contexts:
+                raise RuntimeError("CDP browser has no available context")
+            self.context = self._browser.contexts[0]
+            log("cdp_phase_completed", phase=phase, elapsed_ms=round((time.perf_counter() - phase_started) * 1000))
+            log("cdp_connection_ready", elapsed_ms=round((time.perf_counter() - started) * 1000))
+            return self
+        except BaseException as exc:
+            log("cdp_connection_failed", phase=phase,
+                phase_elapsed_ms=round((time.perf_counter() - phase_started) * 1000),
+                total_elapsed_ms=round((time.perf_counter() - started) * 1000),
+                error_type=type(exc).__name__, error=str(exc)[:1200])
+            # __exit__ is not called by Python when __enter__ raises.
+            try:
+                self.__exit__()
+            except Exception:
+                pass  # Preserve the original connection error.
+            raise
 
     def __exit__(self, *_: object) -> None:
         # A CDP connection must only detach; never close the user-managed browser.
-        if self._pw:
-            self._pw.stop()
+        pw, self._pw = self._pw, None
         self.context = None
+        self._browser = None
+        if pw:
+            pw.stop()
 
     def page(self) -> Page:
         if not self.context:
             raise RuntimeError("CDP client is not connected")
         return self.context.new_page()
 
+    def video_visible(self, bvid: str) -> bool:
+        if not self.context:
+            raise RuntimeError("CDP client is not connected")
+        response = self.context.request.get(
+            "https://api.bilibili.com/x/web-interface/view",
+            params={"bvid": bvid}, timeout=10_000,
+        )
+        if not response.ok:
+            raise RuntimeError(f"Bilibili video check HTTP {response.status}: {bvid}")
+        payload = response.json()
+        if payload.get("code") == 0:
+            return True
+        if payload.get("code") == 62002:
+            return False
+        raise RuntimeError(f"Bilibili video check rejected: code={payload.get('code')} bvid={bvid}")
+
     def uid(self) -> str | None:
         page = self.page()
         try:
             page.goto("https://www.bilibili.com/", wait_until="domcontentloaded", timeout=30_000)
-            value = page.evaluate("""() => fetch('https://api.bilibili.com/x/web-interface/nav', {credentials:'include'})
+            value = page.evaluate("""() => fetch('https://api.bilibili.com/x/web-interface/nav', {credentials:'include', signal:AbortSignal.timeout(10000)})
                 .then(r=>r.json()).then(x=>x.data?.isLogin ? String(x.data.mid) : null)""")
             return value or None
         finally:
@@ -127,7 +294,7 @@ class BilibiliClient:
         page = self.page()
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            page.locator("#commentapp, bili-comments").first.scroll_into_view_if_needed(timeout=10_000)
+            _scroll_to_comment_section(page)
             editor_ready = """() => {
               const comments = document.querySelector('bili-comments')?.shadowRoot;
               const header = comments?.querySelector('bili-comments-header-renderer');
@@ -142,7 +309,7 @@ class BilibiliClient:
                 # initial page load. Reload once so a transient component
                 # state does not turn into a publication failure.
                 page.reload(wait_until="domcontentloaded", timeout=30_000)
-                page.locator("#commentapp, bili-comments").first.scroll_into_view_if_needed(timeout=10_000)
+                _scroll_to_comment_section(page)
                 page.wait_for_function(editor_ready, timeout=15_000)
             # Bilibili's current comment component is nested in shadow roots.
             editor = page.locator("bili-comments").evaluate_handle("""root => {
@@ -190,17 +357,48 @@ class BilibiliClient:
         finally:
             page.close()
 
-    def verify_comment(self, bvid: str, uid: str, text: str, resource_url: str) -> str | None:
+    def verify_comment(self, bvid: str, uid: str, text: str, resource_url: str, remote_comment_id: str | None = None) -> str | None:
         page = self.page()
         try:
-            page.goto(f"https://www.bilibili.com/video/{bvid}/", wait_until="domcontentloaded", timeout=30_000)
+            video_url = f"https://www.bilibili.com/video/{bvid}/"
+            if remote_comment_id and remote_comment_id.isdigit():
+                page.goto(f"{video_url}?comment_on=1&comment_root_id={remote_comment_id}", wait_until="domcontentloaded", timeout=30_000)
+                try:
+                    _scroll_to_comment_section(page)
+                    page.wait_for_function("""({text, uid}) => {
+                      const roots = [document.querySelector('bili-comments')];
+                      while (roots.length) {
+                        const node = roots.shift();
+                        if (!node) continue;
+                        if (node.nodeType === Node.ELEMENT_NODE && node.tagName === 'P'
+                            && node.id === 'contents' && node.textContent === text) {
+                          let parent = node;
+                          while (parent && parent.tagName !== 'BILI-COMMENT-RENDERER')
+                            parent = parent.parentElement || parent.getRootNode()?.host;
+                          if (parent?.shadowRoot?.querySelector(`a[href*="space.bilibili.com/${uid}"]`))
+                            return true;
+                        }
+                        if (node.shadowRoot) roots.push(node.shadowRoot);
+                        roots.push(...node.childNodes);
+                      }
+                      return false;
+                    }""", arg={"text": text, "uid": uid}, timeout=8_000)
+                    return remote_comment_id
+                except (PlaywrightTimeoutError, RuntimeError):
+                    # The anchored comment may not render; try the listing API too.
+                    pass
+            else:
+                page.goto(video_url, wait_until="domcontentloaded", timeout=30_000)
             digest = hashlib.sha256(text.encode()).hexdigest()
             domain = urlparse(resource_url).hostname or ""
             result = page.evaluate("""async ({uid, digest, domain}) => {
               const state=window.__INITIAL_STATE__ || {}; const aid=state.aid || state.videoData?.aid;
               if(!aid) return null;
               for (const sort of [0,2]) for(let pn=1;pn<=5;pn++) {
-                const data=await fetch(`https://api.bilibili.com/x/v2/reply?type=1&oid=${aid}&sort=${sort}&pn=${pn}&ps=20`, {credentials:'include'}).then(r=>r.json());
+                const response=await fetch(`https://api.bilibili.com/x/v2/reply?type=1&oid=${aid}&sort=${sort}&pn=${pn}&ps=20`, {credentials:'include', signal:AbortSignal.timeout(10000)});
+                if(!response.ok) throw new Error(`comment listing HTTP ${response.status}`);
+                const data=await response.json();
+                if(data.code!==0) throw new Error(`comment listing API code ${data.code}`);
                 for(const r of data.data?.replies || []) {
                   const msg=r.content?.message || '';
                   const hash=await crypto.subtle.digest('SHA-256', new TextEncoder().encode(msg));

@@ -25,3 +25,6 @@ class FeishuNotifier:
             payload["sign"] = base64.b64encode(hmac.new(f"{timestamp}\n{self.secret}".encode(), digestmod=hashlib.sha256).digest()).decode()
         response = requests.post(self.webhook, json=payload, timeout=10)
         response.raise_for_status()
+        result = response.json()
+        if result.get('code', result.get('StatusCode', 0)) != 0:
+            raise RuntimeError('Feishu rejected notification')
