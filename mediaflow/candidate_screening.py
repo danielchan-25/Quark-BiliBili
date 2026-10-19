@@ -10,7 +10,7 @@ from pathlib import Path
 import sqlite3
 import time
 
-from mediaflow.audit import write_audit_event
+from mediaflow.audit import write_audit_event, audited
 from mediaflow.config import ROOT
 
 
@@ -98,6 +98,7 @@ def _request_screening(
         getattr(response, 'request_id', None), getattr(response, 'model', None))
 
 
+@audited('candidate_screening')
 def screen_candidate(*, api_key, keyword, resource_category, title, author,
                      cache_path: Path | None = None, log_path: Path | None = None,
                      ttl_seconds: float = 86400) -> ScreeningResult:
@@ -127,6 +128,7 @@ def screen_candidate(*, api_key, keyword, resource_category, title, author,
                 elapsed_ms=round((time.perf_counter()-started)*1000, 2))
             return saved
         try:
+            write_audit_event(log_path, 'typesafe_request_started', cache_key=key, model=model, policy=policy)
             result = _request_screening(api_key=api_key, model=model, base_url=base_url, **inputs)
         except Exception as exc:
             # Never serialize SDK exception bodies: they may contain request data.

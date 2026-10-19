@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
+from mediaflow.audit import audited
 
 
+@audited('account_keywords_load')
 def promotion_keywords(path: Path, account_name: str) -> list[str]:
     """Load the enabled promotion account's manually reviewed search terms."""
     with path.open(encoding="utf-8-sig", newline="") as file:
@@ -23,6 +25,7 @@ def promotion_keywords(path: Path, account_name: str) -> list[str]:
     return keywords
 
 
+@audited('promotion_links_load')
 def promotion_links(path: Path) -> list[str]:
     """Return the configured links for enabled promotion accounts, without duplicates."""
     with path.open(encoding="utf-8-sig", newline="") as file:

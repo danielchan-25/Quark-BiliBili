@@ -36,7 +36,7 @@ class CacheTests(unittest.TestCase):
             self.assertEqual(request.call_count,7)
             raw=params['log_path'].read_text(encoding='utf-8')
             self.assertNotIn('never-log-this',raw)
-            events=[json.loads(line) for line in raw.splitlines()]
+            events=[json.loads(line) for line in raw.splitlines() if json.loads(line)['event'] != 'typesafe_request_started']
             self.assertEqual(events[0]['input_tokens'],123)
             self.assertEqual(events[0]['actual_model'],'test-model')
             self.assertEqual(events[1]['input_tokens'],0)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from mediaflow.audit import audited
 
 
 SCHEMA = """
@@ -25,6 +26,19 @@ CREATE TABLE IF NOT EXISTS promotion_candidates (
 CREATE TABLE IF NOT EXISTS phrases (
  id INTEGER PRIMARY KEY, category TEXT NOT NULL, text TEXT NOT NULL UNIQUE, source TEXT NOT NULL, use_count INTEGER NOT NULL DEFAULT 0,
  last_used_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS historical_comment_videos (
+ bvid TEXT NOT NULL, account_uid TEXT NOT NULL, source TEXT NOT NULL,
+ recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(bvid,account_uid)
+);
+CREATE TABLE IF NOT EXISTS comment_candidate_readiness (
+ account_id INTEGER NOT NULL, bvid TEXT NOT NULL, checked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ expires_at TEXT NOT NULL, PRIMARY KEY(account_id,bvid)
+);
+CREATE TABLE IF NOT EXISTS comment_candidate_cooldowns (
+ account_id INTEGER NOT NULL REFERENCES accounts(id), bvid TEXT NOT NULL,
+ expires_at TEXT NOT NULL, stage TEXT NOT NULL, error_type TEXT NOT NULL,
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(account_id,bvid)
 );
 CREATE TABLE IF NOT EXISTS promotion_reservations (
  bvid TEXT PRIMARY KEY, text_key TEXT NOT NULL UNIQUE, account_id INTEGER NOT NULL,
@@ -62,6 +76,7 @@ INSERT OR IGNORE INTO schema_migrations(version) VALUES(1);
 
 
 class Database:
+    @audited('database_open', 'database.jsonl')
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(path, timeout=15)
@@ -73,6 +88,7 @@ class Database:
         self._migrate()
         self.connection.commit()
 
+    @audited('database_migration', 'database.jsonl')
     def _migrate(self) -> None:
         """Apply additive migrations without rewriting existing promotion history."""
         columns = {
@@ -108,6 +124,8 @@ class Database:
             "ON promotion_candidates(resource_id, platform, ai_status, ai_score DESC)"
         )
         self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(3)")
+        self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(4)")
 
+    @audited('database_close', 'database.jsonl')
     def close(self) -> None:
         self.connection.close()

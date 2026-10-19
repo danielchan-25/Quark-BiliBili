@@ -9,6 +9,13 @@ from tools.import_phrases import import_phrases
 
 
 class TaskResultTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = patch('main.ROOT', Path(self.tmp.name))
+        root.start()
+        self.addCleanup(root.stop)
+
     def test_exception_finishes_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(Path(tmp) / 'db')

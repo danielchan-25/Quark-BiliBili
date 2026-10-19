@@ -14,6 +14,8 @@ data/*
 # Generated reports and local service state
 outputs/
 logs/
+# Local incident reports contain account activity and diagnostic evidence.
+docs/comment-loading-recovery-*.md
 .quark-nd-disk/
 
 # Python

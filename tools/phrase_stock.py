@@ -8,9 +8,10 @@ from mediaflow.config import Settings
 from mediaflow.database import Database
 from mediaflow.dedup import text_key,text_used
 from mediaflow.notify import FeishuNotifier
-from mediaflow.audit import write_audit_event
+from mediaflow.audit import write_audit_event, audited
 
 
+@audited('phrase_inventory', 'phrase-generation.jsonl')
 def inventory(db):
     result=[]
     for resource in db.connection.execute('SELECT * FROM promotion_resources WHERE enabled=1'):
