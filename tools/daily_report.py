@@ -9,7 +9,7 @@ from mediaflow.daily_report import daily_report
 from mediaflow.config import ROOT, Settings
 from mediaflow.delivery import deliver_once
 from mediaflow.notify import FeishuNotifier
-from mediaflow.promotion_schedule import ACCOUNT_HOURS
+from mediaflow.promotion_schedule import ACCOUNT_HOURS, DEFAULT_ACCOUNT, require_local_schedule
 from uuid import uuid4
 
 
@@ -27,13 +27,20 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--date', help='YYYY-MM-DD; defaults to today in Beijing')
     group = parser.add_mutually_exclusive_group()
-    group.add_argument('--account', default='bilibili-35199508')
+    group.add_argument('--account', default=DEFAULT_ACCOUNT)
     group.add_argument('--accounts', nargs='+', choices=tuple(ACCOUNT_HOURS), help='Combine these accounts in one report')
     parser.add_argument('--preview', action='store_true', help='Build a local preview without sending notifications')
     parser.add_argument('--output', help='Save preview text to this path (requires --preview)')
     args = parser.parse_args()
     if args.output and not args.preview:
         parser.error('--output requires --preview')
+    if not args.preview:
+        try:
+            require_local_schedule()
+        except (ValueError, OSError) as exc:
+            print(json.dumps(dict(status='failed', reason='schedule_configuration_required',
+                                  error_type=type(exc).__name__)))
+            raise SystemExit(1)
     try:
         result = daily_report(args.date, args.account, accounts=args.accounts, preview=args.preview)
         if args.output:

@@ -19,7 +19,7 @@ from mediaflow.config import Settings
 from mediaflow.database import Database
 from mediaflow.candidate_pool import maintain_candidate_pool
 from mediaflow.notify import FeishuNotifier
-from mediaflow.promotion_schedule import DEFAULT_ACCOUNT, ACCOUNT_HOURS
+from mediaflow.promotion_schedule import DEFAULT_ACCOUNT, ACCOUNT_HOURS, require_local_schedule
 from mediaflow.scheduled_notifications import BEIJING, alert_scheduled_stop
 from tools.import_phrases import import_phrases
 
@@ -123,7 +123,20 @@ def _run_locked(slot, phase='prepare', phrase_file=None, resume=False, stop_reas
             if client.uid() != expected_uid:
                 return stop('browser_not_logged_in_as_expected_uid')
             operation = 'candidate_check'
-            candidate = workflow.available_visible_candidate(db,client,acc['id'],resources[0]['id'],retain_page=phase=='publish')
+            candidate_error = None
+            try:
+                candidate = workflow.available_visible_candidate(db,client,acc['id'],resources[0]['id'],retain_page=phase=='publish')
+            except CommentPreparationError as exc:
+                if (phase != 'prepare' or not getattr(exc, 'selection_exhausted', False)
+                        or not getattr(exc, 'refill_safe', False)):
+                    raise
+                # All currently selectable videos failed before typing. Permit
+                # one normal, bounded refill in this same preparation attempt.
+                candidate_error, candidate = exc, None
+                state['candidate_recovery'] = dict(
+                    reason='eligible_candidates_exhausted', error_stage=exc.stage,
+                    underlying_error_type=exc.error_type,
+                    candidates_checked=exc.candidates_checked)
         pool = None
         if phase == 'prepare' or candidate is None:
             operation = 'candidate_pool'
@@ -136,6 +149,11 @@ def _run_locked(slot, phase='prepare', phrase_file=None, resume=False, stop_reas
                 if client.uid() != expected_uid:
                     return stop('browser_identity_changed')
                 candidate = workflow.available_visible_candidate(db,client,acc['id'],resources[0]['id'],retain_page=phase=='publish')
+        if not candidate and candidate_error is not None:
+            # A cooldown, failed refill or still-empty pool must retain the
+            # observed browser failure, rather than report a generic empty pool.
+            operation = 'candidate_check'
+            raise candidate_error
         if not candidate:
             return stop('candidate_pool_refill_failed' if pool and pool['status'] == 'failed'
                         else 'no_approved_visible_unpublished_candidate')
@@ -204,7 +222,7 @@ def _run_locked(slot, phase='prepare', phrase_file=None, resume=False, stop_reas
             notifier = FeishuNotifier(os.getenv('FEISHU_WEBHOOK'),os.getenv('FEISHU_SECRET'))
         if isinstance(exc, CommentPreparationError):
             state.update(error_stage=exc.stage,underlying_error_type=exc.error_type,preparation_attempts=exc.attempts)
-            reason = {'navigation':'video_navigation_failed','dom_probe':'browser_dom_access_failed','comment_section':'comment_section_load_failed',
+            reason = {'video_visibility':'video_visibility_check_failed','navigation':'video_navigation_failed','dom_probe':'browser_dom_access_failed','comment_section':'comment_section_load_failed',
                       'comment_permission':'comment_editor_readiness_failed','editor_resolve':'comment_editor_resolve_failed',
                       'editor_click':'comment_editor_focus_failed','editor_focus':'comment_editor_focus_failed'}.get(exc.stage,'comment_editor_readiness_failed')
         else:
@@ -237,6 +255,10 @@ if __name__ == '__main__':
     parser.add_argument('--resume',action='store_true',help='Only after explicit human authorization')
     parser.add_argument('--stop-reason')
     args=parser.parse_args()
+    try:
+        require_local_schedule()
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
     if args.phase == 'prepare':
         from tools.supervised_prepare import supervise_prepare
         result = supervise_prepare(args.slot, args.account, args.resume)

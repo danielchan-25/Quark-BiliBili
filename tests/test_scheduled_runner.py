@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from mediaflow.database import Database
+from mediaflow.bilibili import CommentPreparationError
 from tools.scheduled_promotion import run, ACCOUNT
 
 
@@ -23,16 +24,16 @@ class ScheduledRunnerTests(unittest.TestCase):
         self.addCleanup(maintenance.stop)
 
     @contextlib.contextmanager
-    def second_account(self, browser_uid='1085803742'):
+    def second_account(self, browser_uid='100000002'):
         with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
             root = Path(tmp)
             (root/'data').mkdir()
-            name = 'bilibili-1085803742'
+            name = 'bilibili-100000002'
             (root/'data/account.csv').write_text(
                 '账号,角色,启用状态,推广链接,CDP地址\n'+name+',推广,启用,mock,newmock\n', encoding='utf-8')
             db = Database(root/'db')
-            db.connection.execute("INSERT INTO accounts(name,platform,role,cdp_url,uid) VALUES(?,'bilibili','promotion','oldmock','35199508')", (ACCOUNT,))
-            db.connection.execute("INSERT INTO accounts(name,platform,role,cdp_url,uid) VALUES(?,'bilibili','promotion','newmock','1085803742')", (name,))
+            db.connection.execute("INSERT INTO accounts(name,platform,role,cdp_url,uid) VALUES(?,'bilibili','promotion','oldmock','100000001')", (ACCOUNT,))
+            db.connection.execute("INSERT INTO accounts(name,platform,role,cdp_url,uid) VALUES(?,'bilibili','promotion','newmock','100000002')", (name,))
             db.connection.execute("INSERT INTO promotion_resources(category,url,keywords) VALUES('test','mock','test')")
             db.connection.commit()
             db.close()
@@ -74,24 +75,25 @@ class ScheduledRunnerTests(unittest.TestCase):
                 self.assertEqual(call.args, ('newmock',))
             states = list((root/'data/scheduled-runs').glob('quark-*.json'))
             self.assertEqual(len(states), 1)
-            self.assertEqual(states[0].name, 'quark-bilibili-1085803742-20261009-0140.json')
+            self.assertEqual(states[0].name, 'quark-bilibili-100000002-20261009-0140.json')
             self.assertEqual(json.loads(states[0].read_text())['account'], name)
             notify.send_text.assert_not_called()
 
     def test_second_account_rejects_old_account_uid_and_alerts(self):
-        with self.second_account(browser_uid='35199508') as (root, name, notify, browser, promote):
+        with self.second_account(browser_uid='100000001') as (root, name, notify, browser, promote):
             result = run('2026-10-09T06:40:00+08:00', account=name)
             self.assertEqual(result['reason'], 'browser_not_logged_in_as_expected_uid')
             self.assertTrue(result['alert_sent'])
             notify.send_text.assert_called_once()
             self.assertIn(name, notify.send_text.call_args.args[0])
+            self.maintenance.assert_not_called()
             promote.assert_not_called()
 
     def test_publish_preflight_can_change_target_without_resuming_or_extra_submit(self):
         with self.second_account() as (root, name, notify, browser, promote):
             slot = '2026-10-09T01:40:00+08:00'
             self.assertEqual(run(slot, account=name)['stage'], 'ready')
-            path = root/'data/scheduled-runs/quark-bilibili-1085803742-20261009-0140.json'
+            path = root/'data/scheduled-runs/quark-bilibili-100000002-20261009-0140.json'
             original_attempt = json.loads(path.read_text())['attempt_id']
             promote.return_value = 0
             with patch('tools.scheduled_promotion.workflow.available_visible_candidate',
@@ -135,7 +137,7 @@ class ScheduledRunnerTests(unittest.TestCase):
                        side_effect=CommentPreparationError('dom_probe',3,'TimeoutError')):
                 result=run('2026-10-09T01:40:00+08:00',account=name)
             self.assertEqual(result['reason'],'browser_dom_access_failed')
-            state=json.loads((root/'data/scheduled-runs/quark-bilibili-1085803742-20261009-0140.json').read_text())
+            state=json.loads((root/'data/scheduled-runs/quark-bilibili-100000002-20261009-0140.json').read_text())
             self.assertEqual(state['error_stage'],'dom_probe')
             self.assertEqual(state['comments_submitted'],0)
             self.assertIn('页面自动化读取超时',notify.send_text.call_args.args[0])
@@ -148,10 +150,24 @@ class ScheduledRunnerTests(unittest.TestCase):
                        side_effect=CommentPreparationError('comment_section',2,'TimeoutError')):
                 result=run('2026-10-09T01:40:00+08:00',account=name)
             self.assertEqual(result['reason'],'comment_section_load_failed')
-            state=json.loads((root/'data/scheduled-runs/quark-bilibili-1085803742-20261009-0140.json').read_text())
+            state=json.loads((root/'data/scheduled-runs/quark-bilibili-100000002-20261009-0140.json').read_text())
             self.assertEqual(state['error_stage'],'comment_section')
             self.assertEqual(state['underlying_error_type'],'TimeoutError')
             self.assertIn('评论区加载失败',notify.send_text.call_args.args[0])
+            promote.assert_not_called()
+
+    def test_visibility_timeout_has_specific_alert_without_publication(self):
+        from mediaflow.bilibili import CommentPreparationError
+        with self.second_account() as (root,name,notify,browser,promote):
+            with patch('tools.scheduled_promotion.workflow.available_visible_candidate',
+                       side_effect=CommentPreparationError('video_visibility',3,'TimeoutError')):
+                result=run('2026-10-09T01:40:00+08:00',account=name)
+            self.assertEqual(result['reason'],'video_visibility_check_failed')
+            state=json.loads((root/'data/scheduled-runs/quark-bilibili-100000002-20261009-0140.json').read_text())
+            self.assertEqual(state['error_stage'],'video_visibility')
+            self.assertEqual(state['comments_submitted'],0)
+            self.assertIn('视频可访问性接口读取连续超时',notify.send_text.call_args.args[0])
+            notify.send_text.assert_called_once()
             promote.assert_not_called()
 
     def test_optional_refill_failure_keeps_existing_live_candidate_ready(self):
@@ -172,13 +188,105 @@ class ScheduledRunnerTests(unittest.TestCase):
             self.assertEqual(result['stage'], 'stopped')
             self.assertEqual(result['reason'], 'candidate_pool_refill_failed')
             self.assertTrue(result['alert_sent'])
-            state = json.loads((root/'data/scheduled-runs/quark-bilibili-1085803742-20261009-0640.json').read_text())
+            state = json.loads((root/'data/scheduled-runs/quark-bilibili-100000002-20261009-0640.json').read_text())
             self.assertEqual(state['comments_submitted'], 0)
             notify.send_text.assert_called_once()
             promote.assert_not_called()
 
+    @staticmethod
+    def exhausted_editor_error():
+        error = CommentPreparationError('comment_permission', 3, 'TimeoutError')
+        error.selection_exhausted = True
+        error.refill_safe = True
+        error.candidates_checked = 9
+        return error
+
+    def test_exhausted_editor_candidates_refill_once_before_becoming_ready(self):
+        with self.second_account() as (root, name, notify, browser, promote):
+            self.maintenance.return_value = {'status': 'partial'}
+            candidate = SimpleNamespace(bvid='BVrefilled', title='test', url='video2')
+            with patch('tools.scheduled_promotion.workflow.available_visible_candidate',
+                       side_effect=[self.exhausted_editor_error(), candidate]) as select:
+                result = run('2026-10-09T06:40:00+08:00', account=name)
+            self.assertEqual(result['stage'], 'ready')
+            self.assertEqual(result['bvid'], 'BVrefilled')
+            self.assertEqual(select.call_count, 2)
+            self.maintenance.assert_called_once()
+            self.assertTrue(self.maintenance.call_args.kwargs['force'])
+            state = json.loads((root/'data/scheduled-runs/quark-bilibili-100000002-20261009-0640.json').read_text())
+            self.assertEqual(state['candidate_recovery']['candidates_checked'], 9)
+            self.assertEqual(state['comments_submitted'], 0)
+            self.assertNotIn('record_baseline', state)
+            notify.send_text.assert_not_called()
+            promote.assert_not_called()
+
+    def test_failed_exhausted_pool_refill_preserves_original_browser_error(self):
+        with self.second_account() as (root, name, notify, browser, promote):
+            self.maintenance.return_value = {'status': 'failed', 'reason': 'candidate_pool_refill_failed'}
+            with patch('tools.scheduled_promotion.workflow.available_visible_candidate',
+                       side_effect=[self.exhausted_editor_error(), None]) as select:
+                result = run('2026-10-09T06:40:00+08:00', account=name)
+            self.assertEqual(result['reason'], 'comment_editor_readiness_failed')
+            self.assertEqual(select.call_count, 2)
+            self.maintenance.assert_called_once()
+            state = json.loads((root/'data/scheduled-runs/quark-bilibili-100000002-20261009-0640.json').read_text())
+            self.assertEqual(state['candidate_pool']['status'], 'failed')
+            self.assertEqual(state['error_stage'], 'comment_permission')
+            self.assertEqual(state['underlying_error_type'], 'TimeoutError')
+            self.assertEqual(state['comments_submitted'], 0)
+            notify.send_text.assert_called_once()
+            promote.assert_not_called()
+
+    def test_exhausted_pool_recovery_never_refills_twice(self):
+        with self.second_account() as (root, name, notify, browser, promote):
+            self.maintenance.return_value = {'status': 'partial'}
+            with patch('tools.scheduled_promotion.workflow.available_visible_candidate',
+                       side_effect=[self.exhausted_editor_error(), self.exhausted_editor_error()]) as select:
+                result = run('2026-10-09T06:40:00+08:00', account=name)
+            self.assertEqual(result['reason'], 'comment_editor_readiness_failed')
+            self.assertEqual(select.call_count, 2)
+            self.maintenance.assert_called_once()
+            notify.send_text.assert_called_once()
+            promote.assert_not_called()
+
+    def test_unmarked_or_unsafe_candidate_failure_does_not_refill(self):
+        for stage, error_type, reason, marked in (
+                ('comment_permission', 'TimeoutError', '', False),
+                ('dom_probe', 'TimeoutError', '', True),
+                ('navigation', 'TimeoutError', '', True),
+                ('navigation', 'HTTPError', 'document_http_error', False),
+                ('video_visibility', 'TimeoutError', '', True),
+                ('comment_section', 'TimeoutError', 'comment_section_repeated_timeout', True)):
+            with self.subTest(stage=stage, error_type=error_type), self.second_account() as (root, name, notify, browser, promote):
+                error = CommentPreparationError(stage, 3, error_type, reason)
+                if marked:
+                    error.selection_exhausted, error.refill_safe = True, False
+                if reason == 'comment_section_repeated_timeout':
+                    error.timeout_videos = []
+                self.maintenance.reset_mock()
+                with patch('tools.scheduled_promotion.workflow.available_visible_candidate', side_effect=error):
+                    result = run('2026-10-09T06:40:00+08:00', account=name)
+                self.assertEqual(result['stage'], 'stopped')
+                self.maintenance.assert_not_called()
+                notify.send_text.assert_called_once()
+                promote.assert_not_called()
+
+    def test_publish_phase_never_uses_exhausted_pool_recovery(self):
+        with self.second_account() as (root, name, notify, browser, promote):
+            slot = '2026-10-09T06:40:00+08:00'
+            self.assertEqual(run(slot, account=name)['stage'], 'ready')
+            self.maintenance.reset_mock()
+            with patch('tools.scheduled_promotion.workflow.available_visible_candidate',
+                       side_effect=self.exhausted_editor_error()) as select:
+                result = run(slot, 'publish', account=name)
+            self.assertEqual(result['reason'], 'comment_editor_readiness_failed')
+            select.assert_called_once()
+            self.maintenance.assert_not_called()
+            notify.send_text.assert_called_once()
+            promote.assert_not_called()
+
     def test_stopped_round_is_not_automatically_refilled_or_resumed(self):
-        with self.second_account(browser_uid='35199508') as (root, name, notify, browser, promote):
+        with self.second_account(browser_uid='100000001') as (root, name, notify, browser, promote):
             slot = '2026-10-09T06:40:00+08:00'
             self.assertEqual(run(slot, account=name)['stage'], 'stopped')
             self.assertEqual(run(slot, account=name)['stage'], 'already_exists')
@@ -202,7 +310,7 @@ class ScheduledRunnerTests(unittest.TestCase):
     def test_second_account_slot_normalizes_beijing_date(self):
         with self.second_account() as (root, name, notify, browser, promote):
             self.assertEqual(run('2026-10-08T17:40:00+00:00', account=name)['stage'], 'ready')
-            state = json.loads((root/'data/scheduled-runs/quark-bilibili-1085803742-20261009-0140.json').read_text())
+            state = json.loads((root/'data/scheduled-runs/quark-bilibili-100000002-20261009-0140.json').read_text())
             self.assertEqual(state['slot'], '2026-10-09T01:40:00+08:00')
 
     def test_phrase_preparation_failure_alerts_before_main_promotion(self):
@@ -210,7 +318,7 @@ class ScheduledRunnerTests(unittest.TestCase):
             root=Path(tmp);(root/'data').mkdir()
             (root/'data/account.csv').write_text('账号,角色,启用状态,推广链接\n'+ACCOUNT+',推广,启用,mock\n',encoding='utf-8')
             db=Database(root/'db')
-            db.connection.execute("INSERT INTO accounts(name,platform,role,cdp_url,uid) VALUES(?,'bilibili','promotion','mock','35199508')",(ACCOUNT,))
+            db.connection.execute("INSERT INTO accounts(name,platform,role,cdp_url,uid) VALUES(?,'bilibili','promotion','mock','100000001')",(ACCOUNT,))
             db.connection.execute("INSERT INTO promotion_resources(category,url,keywords) VALUES('test','mock','test')")
             db.connection.commit();db.close()
             settings=SimpleNamespace(database_path=root/'db',feishu_webhook='mock',feishu_secret=None)
@@ -218,7 +326,7 @@ class ScheduledRunnerTests(unittest.TestCase):
             candidate=SimpleNamespace(bvid='BVtest',title='test',url='video')
             bad_file=root/'bad.json';bad_file.write_text('invalid JSON')
             with patch('tools.scheduled_promotion.ROOT',root), patch('tools.scheduled_promotion.Settings.load',return_value=settings), patch('tools.scheduled_promotion.FeishuNotifier',return_value=notify), patch('tools.scheduled_promotion.BilibiliClient') as browser, patch('tools.scheduled_promotion.workflow.available_visible_candidate',return_value=candidate), patch('tools.scheduled_promotion.workflow.choose_phrase',return_value=('text','mock',None)), patch('tools.scheduled_promotion.workflow.promotion') as promote:
-                browser.return_value.__enter__.return_value.uid.return_value='35199508'
+                browser.return_value.__enter__.return_value.uid.return_value='100000001'
                 self.assertEqual(run('2026-10-07T15:40:00+08:00')['stage'],'ready')
                 self.assertEqual(run('2026-10-07T15:40:00+08:00','publish',str(bad_file))['stage'],'stopped')
                 notify.send_text.assert_called_once()
@@ -244,7 +352,7 @@ class ScheduledRunnerTests(unittest.TestCase):
             root=Path(tmp);(root/'data').mkdir()
             (root/'data/account.csv').write_text('账号,角色,启用状态,推广链接\n'+ACCOUNT+',推广,启用,mock\n',encoding='utf-8')
             db=Database(root/'db')
-            db.connection.execute("INSERT INTO accounts(name,platform,role,cdp_url,uid) VALUES(?,'bilibili','promotion','mock','35199508')",(ACCOUNT,))
+            db.connection.execute("INSERT INTO accounts(name,platform,role,cdp_url,uid) VALUES(?,'bilibili','promotion','mock','100000001')",(ACCOUNT,))
             db.connection.execute("INSERT INTO promotion_resources(category,url,keywords) VALUES('test','mock','test')")
             db.connection.commit();db.close()
             settings=SimpleNamespace(database_path=root/'db',feishu_webhook='mock',feishu_secret=None)

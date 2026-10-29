@@ -27,6 +27,15 @@ venv/
 .pytest_cache/
 .coverage
 htmlcov/
+work/
+backups/
+*.backup
+*.zip
+*.tar
+*.tar.gz
+*.sqlite3
+*.sqlite3-*
+config/schedules.toml
 
 # Node.js and editor files
 tools/node_modules/

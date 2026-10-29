@@ -20,7 +20,9 @@ from mediaflow.config import Settings
 from mediaflow.notify import FeishuNotifier
 from playwright.sync_api import Keyboard
 
-ACCOUNTS = ('bilibili-35199508', 'bilibili-1085803742')
+from mediaflow.promotion_schedule import ACCOUNT_HOURS
+
+ACCOUNTS = tuple(ACCOUNT_HOURS)
 BEIJING = timezone(timedelta(hours=8))
 
 

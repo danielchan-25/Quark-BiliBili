@@ -23,6 +23,7 @@ from mediaflow.database import Database
 from mediaflow.delivery import deliver_once
 from mediaflow.notify import FeishuNotifier
 from mediaflow.toutiao import content_hash, parse_article
+from mediaflow.time_utils import BEIJING, beijing_now, publication_time, utc_time
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -138,7 +139,7 @@ def toutiao(db: Database, args: argparse.Namespace) -> int:
                 account_row["id"], "toutiao", article.url, article.article_id,
                 "article", article.article_id, args.text.strip(), content_hash(args.text),
                 args.status, args.verification, args.detail or "manual_record",
-                args.published_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                args.published_at or beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
             ),
         )
         db.connection.commit()
@@ -157,14 +158,12 @@ def toutiao(db: Database, args: argparse.Namespace) -> int:
 
 
 def rate_ready(db: Database, account_id: int) -> tuple[bool, str]:
-    now=datetime.now(); today=now.strftime("%Y-%m-%d")
-    rows=db.connection.execute("SELECT created_at FROM promotion_records WHERE account_id=? AND publish_status IN ('published','submitted') ORDER BY created_at DESC", (account_id,)).fetchall()
-    daily=sum(1 for r in rows if str(r["created_at"]).startswith(today))
-    if daily >= 5: return False, "daily comment limit reached (5/5)"
-    if rows:
-        last=datetime.fromisoformat(str(rows[0]["created_at"]).replace("Z","+00:00").replace(" ","T"))
-        if now-last.replace(tzinfo=None) < timedelta(minutes=15): return False, "minimum 15-minute interval has not elapsed"
-    return True, f"daily {daily}/5"
+    now=beijing_now()
+    row=db.connection.execute("SELECT created_at FROM promotion_records WHERE account_id=? AND publish_status IN ('published','submitted') ORDER BY created_at DESC LIMIT 1", (account_id,)).fetchone()
+    if row:
+        last=publication_time(row["created_at"])
+        if now-last < timedelta(minutes=15): return False, "minimum 15-minute interval has not elapsed"
+    return True, "minimum interval satisfied"
 
 
 def render_phrase(text: str, category: str, url: str) -> str:
@@ -252,6 +251,7 @@ def available_visible_candidate(db: Database, client: BilibiliClient, account_id
     timeout_videos = []
     permission_skips = 0
     failure_candidates = 0
+    refill_safe = True
     while candidate:
         remaining = budget_seconds - (task_clock.monotonic() - started)
         if failure_candidates >= max_candidates or permission_skips >= max_permission_skips > 0 or remaining <= 0:
@@ -261,14 +261,15 @@ def available_visible_candidate(db: Database, client: BilibiliClient, account_id
             if last_error:
                 raise last_error
             return None
-        visible = client.video_visible(candidate.bvid)
-        if visible:
-            remaining = budget_seconds - (task_clock.monotonic() - started)
-            if remaining <= 0:
-                write_audit_event(ROOT/'logs/workflow.jsonl', 'candidate_selection_exhausted',
-                                  account_id=account_id, candidates_checked=len(excluded), reason='budget_exhausted')
-                raise last_error or CommentPreparationError('selection_budget', 0, 'TimeoutError')
-            try:
+        visible = None
+        try:
+            visible = client.video_visible(candidate.bvid)
+            if visible:
+                remaining = budget_seconds - (task_clock.monotonic() - started)
+                if remaining <= 0:
+                    write_audit_event(ROOT/'logs/workflow.jsonl', 'candidate_selection_exhausted',
+                                      account_id=account_id, candidates_checked=len(excluded), reason='budget_exhausted')
+                    raise last_error or CommentPreparationError('selection_budget', 0, 'TimeoutError')
                 # Visibility alone does not imply permission to comment. This
                 # check never types and runs before consuming a phrase/reserving.
                 client.check_comment_editor(candidate.url, retain=retain_page,
@@ -279,44 +280,56 @@ def available_visible_candidate(db: Database, client: BilibiliClient, account_id
                         DO UPDATE SET checked_at=CURRENT_TIMESTAMP,expires_at=excluded.expires_at""", (account_id,candidate.bvid))
                     db.connection.commit()
                 break
-            except CommentPreparationError as exc:
-                disabled = exc.reason in ('comments_disabled_by_author', 'comments_disabled')
-                transient = exc.error_type == 'TimeoutError' or exc.stage in ('editor_resolve', 'editor_focus')
-                if not disabled and not transient:
-                    raise
-                if disabled and max_permission_skips:
-                    permission_skips += 1
-                else:
-                    failure_candidates += 1
-                last_error = exc if not disabled else last_error
-                if len(exc.failures) == 3 and all(f['stage'] == 'comment_section' and f['error_type'] == 'TimeoutError' for f in exc.failures):
-                    timeout_videos.append(dict(bvid=candidate.bvid, failures=exc.failures))
-                if len(timeout_videos) == 3:
-                    exc.reason = 'comment_section_repeated_timeout'
-                    exc.timeout_videos = timeout_videos
-                    write_audit_event(ROOT/'logs/workflow.jsonl', 'comment_section_repeated_timeout',
-                                      account_id=account_id, videos=timeout_videos, total_attempts=9,
-                                      diagnosis_required=True)
-                cooldown_minutes = 360 if disabled else 30
-                if mutate:
-                    db.connection.execute('DELETE FROM comment_candidate_readiness WHERE account_id=? AND bvid=?', (account_id,candidate.bvid))
-                    db.connection.execute('''INSERT INTO comment_candidate_cooldowns(account_id,bvid,expires_at,stage,error_type)
-                        VALUES(?,?,datetime('now',?),?,?) ON CONFLICT(account_id,bvid)
-                        DO UPDATE SET expires_at=excluded.expires_at,stage=excluded.stage,
-                        error_type=excluded.error_type,updated_at=CURRENT_TIMESTAMP''',
-                        (account_id, candidate.bvid, f'+{cooldown_minutes} minutes', exc.stage, exc.error_type))
-                    db.connection.commit()
-                write_audit_event(ROOT/'logs/workflow.jsonl', 'candidate_comments_disabled' if disabled else 'candidate_preparation_skipped',
-                                  account_id=account_id, bvid=candidate.bvid, resource_id=resource_id,
-                                  reason=exc.reason, error_stage=exc.stage, error_type=exc.error_type,
-                                  cooldown_minutes=cooldown_minutes, persisted=mutate, candidate_attempt=len(excluded)+1)
-        else:
-            failure_candidates += 1
-            write_audit_event(ROOT/'logs/workflow.jsonl', 'candidate_unavailable', bvid=candidate.bvid, resource_id=resource_id, persisted=mutate)
+            else:
+                failure_candidates += 1
+                write_audit_event(ROOT/'logs/workflow.jsonl', 'candidate_unavailable', bvid=candidate.bvid, resource_id=resource_id, persisted=mutate)
+        except CommentPreparationError as exc:
+            if exc.stage == 'selection_budget':
+                raise
+            disabled = exc.reason in ('comments_disabled_by_author', 'comments_disabled')
+            transient = exc.error_type == 'TimeoutError' or exc.stage in ('editor_resolve', 'editor_focus')
+            if not disabled and not transient:
+                raise
+            # A different video can recover candidate-specific editor failures.
+            # Connection, DOM-channel and repeated comment-section failures need
+            # investigation rather than hiding the failure behind new stock.
+            refill_safe = refill_safe and (
+                (disabled or exc.stage in ('comment_permission', 'editor_resolve', 'editor_click', 'editor_focus'))
+                and getattr(exc, 'classification', '') != 'playwright_dom_access_failed_native_responsive'
+                and getattr(exc, 'failure_classification', '') != 'playwright_dom_access_failed_native_responsive'
+                and not any(f.get('stage') == 'dom_probe'
+                            or f.get('classification') == 'playwright_dom_access_failed_native_responsive'
+                            for f in exc.failures))
+            if disabled and max_permission_skips:
+                permission_skips += 1
+            else:
+                failure_candidates += 1
+            last_error = exc if not disabled else last_error
+            if len(exc.failures) == 3 and all(f['stage'] == 'comment_section' and f['error_type'] == 'TimeoutError' for f in exc.failures):
+                timeout_videos.append(dict(bvid=candidate.bvid, failures=exc.failures))
+            if len(timeout_videos) == 3:
+                exc.reason = 'comment_section_repeated_timeout'
+                exc.timeout_videos = timeout_videos
+                write_audit_event(ROOT/'logs/workflow.jsonl', 'comment_section_repeated_timeout',
+                                  account_id=account_id, videos=timeout_videos, total_attempts=9,
+                                  diagnosis_required=True)
+            cooldown_minutes = 360 if disabled else 30
+            if mutate:
+                db.connection.execute('DELETE FROM comment_candidate_readiness WHERE account_id=? AND bvid=?', (account_id,candidate.bvid))
+                db.connection.execute('''INSERT INTO comment_candidate_cooldowns(account_id,bvid,expires_at,stage,error_type)
+                    VALUES(?,?,datetime('now',?),?,?) ON CONFLICT(account_id,bvid)
+                    DO UPDATE SET expires_at=excluded.expires_at,stage=excluded.stage,
+                    error_type=excluded.error_type,updated_at=CURRENT_TIMESTAMP''',
+                    (account_id, candidate.bvid, f'+{cooldown_minutes} minutes', exc.stage, exc.error_type))
+                db.connection.commit()
+            write_audit_event(ROOT/'logs/workflow.jsonl', 'candidate_comments_disabled' if disabled else 'candidate_preparation_skipped',
+                              account_id=account_id, bvid=candidate.bvid, resource_id=resource_id,
+                              reason=exc.reason, error_stage=exc.stage, error_type=exc.error_type,
+                              cooldown_minutes=cooldown_minutes, persisted=mutate, candidate_attempt=len(excluded)+1)
         excluded.append(candidate.bvid)
         # Permission can depend on the account. Do not globally disable a
         # video for other accounts when this account cannot comment on it.
-        if mutate and not visible:
+        if mutate and visible is False:
             db.connection.execute(
                 "UPDATE promotion_candidates SET status='unavailable' WHERE resource_id=? AND platform='bilibili' AND bvid=?",
                 (resource_id, candidate.bvid),
@@ -325,6 +338,10 @@ def available_visible_candidate(db: Database, client: BilibiliClient, account_id
         candidate = available_candidate(db, account_id, resource_id, tuple(excluded))
     if not candidate and last_error:
         # Preserve the actual loading failure for the scheduled alert.
+        # Mark only an exhausted pool, never a budget/candidate-limit exit.
+        last_error.selection_exhausted = True
+        last_error.candidates_checked = len(excluded)
+        last_error.refill_safe = refill_safe and last_error.reason != 'comment_section_repeated_timeout'
         write_audit_event(ROOT/'logs/workflow.jsonl', 'candidate_selection_exhausted',
                           account_id=account_id, candidates_checked=len(excluded),
                           reason='eligible_candidates_exhausted',
@@ -540,12 +557,12 @@ def replenish_promotion_candidates(db, account, policy, target, report):
 
 @audited('legacy_task_summary')
 def promotion_summary(db: Database, notify: FeishuNotifier, args: argparse.Namespace) -> int:
-    day = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else datetime.now().date()
+    day = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else beijing_now().date()
     # SQLite CURRENT_TIMESTAMP is UTC while schedules and notifications use
     # China Standard Time. Convert the local calendar-day bounds to UTC before
     # querying, so the 00:00–07:59 local slots stay in the correct daily report.
-    local_start = datetime.combine(day, time.min)
-    utc_start = local_start - timedelta(hours=8)
+    local_start = datetime.combine(day, time.min, BEIJING)
+    utc_start = local_start.astimezone(timezone.utc)
     utc_end = utc_start + timedelta(days=1)
     rows = db.connection.execute(
         """SELECT a.name, a.platform, tr.status, tr.detail, tr.started_at
@@ -562,7 +579,7 @@ def promotion_summary(db: Database, notify: FeishuNotifier, args: argparse.Names
     lines = ["【MediaProject】【推广】", ""]
     for row in rows:
         detail = row["detail"] or ""
-        slot = detail_value(detail, "slot") or (datetime.fromisoformat(row['started_at']) + timedelta(hours=8)).strftime('%H:%M')
+        slot = detail_value(detail, "slot") or utc_time(row['started_at']).astimezone(BEIJING).strftime('%H:%M')
         platform = {"bilibili": "BiliBili", "toutiao": "今日头条"}.get(row["platform"], row["platform"])
         line = f"- {slot}: 平台={platform}, 账户={row['name']}, {labels.get(row['status'], '失败')}"
         reason = detail_value(detail, "reason")
@@ -604,7 +621,7 @@ def promotion(db: Database, notify: FeishuNotifier, args: argparse.Namespace) ->
             try:
                 if not notify.webhook:
                     raise RuntimeError('FEISHU_WEBHOOK not configured')
-                clock = (datetime.fromisoformat(result['started_at']) + timedelta(hours=8)).strftime('%H:%M')
+                clock = utc_time(result['started_at']).astimezone(BEIJING).strftime('%H:%M')
                 reason = (detail_value(result['detail'] or '', 'reason') or result['detail'] or '发布未完成').replace('\r', ' ').replace('\n', ' ')
                 deliver_once(ROOT/'data/notification-receipts'/f'promotion-{run_id}.json', notify,
                              f"【Quark-BiliBili】\n\n- {clock}: 平台=BiliBili, 账户={acc['name']}, 失败，原因={redact(reason)}",
@@ -695,7 +712,7 @@ def _promotion(db: Database, notify: FeishuNotifier, args: argparse.Namespace, r
                 publish_status,verification_status,detail,created_at)
                 VALUES(?,?,?,'bilibili',?,?,?,?,'submitted','submission_started',?,?)""",
                 (acc['id'],resource['id'],candidate_row['id'] if candidate_row else None,candidate.url,candidate.bvid,
-                 text,hashlib.sha256(text.encode()).hexdigest(),f'source={source}',datetime.now().strftime('%Y-%m-%d %H:%M:%S'))).lastrowid
+                 text,hashlib.sha256(text.encode()).hexdigest(),f'source={source}',beijing_now().strftime('%Y-%m-%d %H:%M:%S'))).lastrowid
             db.connection.commit()
             event('submission_intent_saved', record_id=record_id, bvid=candidate.bvid)
             remote = None

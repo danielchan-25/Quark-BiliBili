@@ -1,0 +1,11 @@
+# Fictional IDs only. Replace both account names with accounts you own.
+# Keep this configured copy in data/schedules.toml, outside Git.
+timezone = "Asia/Shanghai"
+minute = 40
+default_account = "bilibili-100000001"
+
+[accounts.bilibili-100000001]
+hours = [0, 5, 10, 15, 20]
+
+[accounts.bilibili-100000002]
+hours = [1, 6, 11, 16, 21]

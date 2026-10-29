@@ -78,11 +78,14 @@ class DailyReportTests(unittest.TestCase):
             result=self.call_report()
         self.assertEqual(result['status'],'sent')
         message=self.notify.send_text.call_args.args[0]
-        self.assertTrue(message.startswith('【Quark-BiliBili】\n2026-10-06\n任务状态：成功0,失败5\n'))
+        # An account without a configured schedule must not inherit another
+        # account's example slots and fabricate four extra missed runs.
+        self.assertTrue(message.startswith('【Quark-BiliBili】\n2026-10-06\n任务状态：成功0,失败1\n'))
         self.assertIn('账户: a',message)
         self.assertIn('- 20:40,任务失败：（浏览器 CDP 连接不可用',message)
         report=json.loads((self.root/'data/daily-reports/a-2026-10-06.json').read_text(encoding='utf-8'))
         self.assertEqual(report['published'],1)
+        self.assertEqual(report['missing_slots'], [])
         self.assertEqual(report['task_records_successful'],1)
         self.assertEqual(report['task_records_failed'],0)
         self.assertEqual(before,'\n'.join(self.db.connection.iterdump()))
@@ -99,13 +102,13 @@ class DailyReportTests(unittest.TestCase):
         self.notify.send_text.assert_called_once()
 
     def test_second_account_daily_report_uses_its_schedule_and_records(self):
-        account = 'bilibili-1085803742'
-        self.db.connection.execute("INSERT INTO accounts(id,name,platform,role,cdp_url,uid) VALUES(2,?,'bilibili','promotion','newmock','1085803742')", (account,))
+        account = 'bilibili-100000002'
+        self.db.connection.execute("INSERT INTO accounts(id,name,platform,role,cdp_url,uid) VALUES(2,?,'bilibili','promotion','newmock','100000002')", (account,))
         self.db.connection.execute("""INSERT INTO promotion_records(account_id,platform,video_url,bvid,text,content_hash,publish_status,verification_status,created_at)
             VALUES(2,'bilibili','video2','BVtwo','text2','hash2','published','verified','2026-10-06 01:41:00')""")
         self.db.connection.commit()
         folder = self.root/'data/scheduled-runs'
-        (folder/'quark-bilibili-1085803742-20261006-0140.json').write_text(json.dumps(
+        (folder/'quark-bilibili-100000002-20261006-0140.json').write_text(json.dumps(
             {'account':account,'slot':'2026-10-06T01:40:00+08:00','stage':'completed'}))
         result = daily_report('2026-10-06',account,settings=self.settings,notifier=self.notify,root=self.root)
         self.assertEqual(result['published'], 1)
@@ -115,7 +118,7 @@ class DailyReportTests(unittest.TestCase):
         self.assertEqual([r['bvid'] for r in report['records']], ['BVtwo'])
 
     def test_new_schedule_does_not_count_slots_before_activation_as_missing(self):
-        account = 'bilibili-1085803742'
+        account = 'bilibili-100000002'
         folder = self.root/'data/promotion-schedules'
         folder.mkdir()
         (folder/f'{account}.json').write_text(json.dumps(

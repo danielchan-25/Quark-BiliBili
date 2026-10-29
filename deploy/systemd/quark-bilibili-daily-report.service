@@ -1,0 +1,14 @@
+[Unit]
+Description=Quark-BiliBili report only (optional; do not duplicate the agent report task)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@@PROJECT@@
+ExecStart=/usr/bin/bash @@RUN@@ --send
+Environment=TZ=Asia/Shanghai
+Environment=PYTHONUTF8=1
+UMask=0077
+TimeoutStartSec=180
+KillMode=control-group
+Restart=no

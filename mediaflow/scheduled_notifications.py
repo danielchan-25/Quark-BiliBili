@@ -17,6 +17,7 @@ REASONS = {
     'browser_connection_failed': '连接浏览器失败，请检查CDP连接日志',
     'browser_identity_check_failed': '浏览器登录身份读取失败',
     'video_navigation_failed': '视频页面导航或加载失败（非候选或文案库存不足）',
+    'video_visibility_check_failed': '视频可访问性接口读取连续超时（非候选或文案库存不足），请检查网络及浏览器请求通道',
     'browser_dom_access_failed': '页面自动化读取超时，尚未完成评论区检测，请检查浏览器读取通道及主机负载',
     'comment_section_load_failed': '视频评论区加载失败（非候选或文案库存不足）',
     'comment_editor_readiness_failed': '主评论输入框未就绪或评论权限受限',

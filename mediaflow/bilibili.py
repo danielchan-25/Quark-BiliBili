@@ -48,7 +48,7 @@ class CommentPreparationError(RuntimeError):
         self.stage, self.attempts = stage, attempts
         self.reason, self.error_type = reason, error_type
         self.failures = []
-        labels = {'navigation': '视频页面加载', 'dom_probe': '页面自动化读取检查', 'comment_section': '评论区加载', 'selection_budget': '候选检查预算',
+        labels = {'video_visibility': '视频可访问性检查', 'navigation': '视频页面加载', 'dom_probe': '页面自动化读取检查', 'comment_section': '评论区加载', 'selection_budget': '候选检查预算',
                   'comment_permission': '评论权限及主输入框就绪检查', 'editor_resolve': '主输入框定位',
                   'editor_click': '主输入框可见性及点击', 'editor_focus': '主输入框焦点检查'}
         hints = {'comments_disabled_by_author': '作者隐私设置限制评论',
@@ -131,7 +131,7 @@ def _recover_stalled_profile_info_tab(base_url: str, browser_endpoint: str) -> b
 
 
 def _scroll_to_comment_section(page: Page, *, reload_once: bool = True, deadline: float | None = None) -> None:
-    """Wait for Bilibili's asynchronously injected comment root before scrolling."""
+    """Wake the comment region, then scroll its rendered component into view."""
     timeout = lambda limit: _remaining_timeout(deadline, limit) if deadline is not None else limit
     selector = "#commentapp, bili-comments"
     root = page.locator(selector).first
@@ -167,7 +167,14 @@ def _scroll_to_comment_section(page: Page, *, reload_once: bool = True, deadline
                 })""")
                 raise RuntimeError(f"Bilibili comment section did not render after one safe reload: {state}")
         try:
-            root.scroll_into_view_if_needed(timeout=timeout(10_000))
+            # #commentapp can be an empty, zero-height placeholder. Its layout
+            # moves while the video metadata loads, so scrolling that placeholder
+            # does not activate the real component's intersection-based loader.
+            # Wait for the component's nonempty box before the decisive scroll.
+            with audit_step('comment_component_scroll', 'browser-flow.jsonl', attempt=attempt + 1):
+                component = page.locator('bili-comments').first
+                component.wait_for(state="visible", timeout=timeout(15_000))
+                component.scroll_into_view_if_needed(timeout=timeout(10_000))
             return
         except PlaywrightTimeoutError:
             if not reload_once:
@@ -195,6 +202,7 @@ def _comment_page_state(page: Page) -> dict:
       const disabled = h?.shadowRoot?.querySelector('#disabled-commentbox');
       const editor = box?.shadowRoot?.querySelector('bili-comment-rich-textarea')
         ?.shadowRoot?.querySelector('.brt-editor[contenteditable=true]');
+      const rect = root?.getBoundingClientRect();
       return {ready_state: document.readyState, document_hidden: document.hidden,
         visibility_state: document.visibilityState, comment_root: !!root,
         comment_shadow: !!comments, comment_header: !!h, header_shadow: !!h?.shadowRoot,
@@ -202,6 +210,9 @@ def _comment_page_state(page: Page) -> dict:
         header_defined: !!customElements.get('bili-comments-header-renderer'),
         box_defined: !!customElements.get('bili-comment-box'),
         comment_box: !!box, editor: !!editor,
+        comment_root_top: rect?.top ?? null, comment_root_height: rect?.height ?? null,
+        viewport_height: innerHeight,
+        comment_spinner: !!comments?.querySelector('#spinner-container'),
         comments_disabled: !!disabled?.getClientRects().length,
         editor_connected: !!editor?.isConnected,
         editor_visible: !!editor?.getClientRects().length,
@@ -411,7 +422,7 @@ def _prepare_comment_editor(page: Page, url: str, *, budget_seconds: float = 90,
                     write_audit_event(ROOT/'logs/browser-flow.jsonl', 'comment_preparation_error',
                                       error_detail=str(exc)[:2000], **fields)
                     diagnosis, state = {}, {}
-                    if failure_probe is not None and error_type == 'TimeoutError' and stage in ('dom_probe', 'comment_section', 'comment_permission', 'editor_resolve', 'editor_click') and deadline - time.monotonic() > 8:
+                    if failure_probe is not None and error_type == 'TimeoutError' and stage in ('navigation', 'dom_probe', 'comment_section', 'comment_permission', 'editor_resolve', 'editor_click') and deadline - time.monotonic() > 8:
                         try:
                             diagnosis = failure_probe(page, preparation_id=preparation_id, attempt=attempt) or {}
                             if not isinstance(diagnosis, dict):
@@ -431,6 +442,7 @@ def _prepare_comment_editor(page: Page, url: str, *, budget_seconds: float = 90,
                             write_audit_event(ROOT/'logs/browser-flow.jsonl', 'comment_diagnostics_unavailable',
                                               preparation_id=preparation_id, error_type=type(diagnostic_error).__name__)
                     classification = _comment_failure_classification(state, diagnosis)
+                    failures[-1]['classification'] = classification
                     write_audit_event(ROOT/'logs/browser-flow.jsonl', 'comment_failure_analysis',
                                       classification=classification,
                                       comment_api_statuses={k: v-api_statuses_before.get(k, 0) for k, v in network.comment_api_statuses.items() if v > api_statuses_before.get(k, 0)},
@@ -443,6 +455,7 @@ def _prepare_comment_editor(page: Page, url: str, *, budget_seconds: float = 90,
                         error = CommentPreparationError('comment_permission', attempt,
                                                         'CommentUnavailable', 'comments_disabled')
                         error.failures = failures
+                        error.failure_classification = classification
                         raise error from exc
                     if error_type == 'TimeoutError' and attempt < 3 and time.monotonic() < deadline:
                         recovery = 'navigate_again_before_typing'
@@ -459,6 +472,7 @@ def _prepare_comment_editor(page: Page, url: str, *, budget_seconds: float = 90,
                         continue
                     error = exc if isinstance(exc, CommentPreparationError) else CommentPreparationError(stage, attempt, error_type)
                     error.failures = failures
+                    error.failure_classification = classification
                     raise error from exc
         finally:
             write_audit_event(ROOT/'logs/browser-flow.jsonl', 'comment_preparation_network',
@@ -597,10 +611,23 @@ class BilibiliClient:
     def video_visible(self, bvid: str) -> bool:
         if not self.context:
             raise RuntimeError("CDP client is not connected")
-        response = self.context.request.get(
-            "https://api.bilibili.com/x/web-interface/view",
-            params={"bvid": bvid}, timeout=10_000,
-        )
+        # Retry only a timed-out read. An HTTP/business rejection is not a
+        # transient timeout and must never be treated as a deleted video.
+        deadline = time.monotonic() + 30
+        for attempt in (1, 2, 3):
+            try:
+                with audit_step('video_visibility_attempt', 'browser-flow.jsonl',
+                                bvid=bvid, attempt=attempt):
+                    response = self.context.request.get(
+                        "https://api.bilibili.com/x/web-interface/view",
+                        params={"bvid": bvid}, timeout=_remaining_timeout(deadline, 10_000),
+                    )
+                break
+            except PlaywrightTimeoutError as exc:
+                if attempt == 3 or time.monotonic() >= deadline:
+                    raise CommentPreparationError('video_visibility', attempt, 'TimeoutError') from exc
+                write_audit_event(ROOT/'logs/browser-flow.jsonl', 'video_visibility_retry',
+                                  bvid=bvid, attempt=attempt, recovery='retry_read_only_request')
         if not response.ok:
             raise RuntimeError(f"Bilibili video check HTTP {response.status}: {bvid}")
         payload = response.json()
@@ -612,15 +639,70 @@ class BilibiliClient:
 
     @audited('browser_login', 'browser-flow.jsonl')
     def uid(self) -> str | None:
+        if not self.context:
+            raise RuntimeError("CDP client is not connected")
+        # The context request shares this browser's cookie jar. Identity does
+        # not require loading a media-heavy homepage or a working DOM channel.
+        deadline = time.monotonic() + 30
+        source = 'authenticated_context_request'
+        for attempt in (1, 2, 3):
+            try:
+                with audit_step('browser_identity_request', 'browser-flow.jsonl', attempt=attempt):
+                    response = self.context.request.get(
+                        'https://api.bilibili.com/x/web-interface/nav',
+                        timeout=_remaining_timeout(deadline, 10_000))
+                break
+            except PlaywrightTimeoutError:
+                if attempt == 3 or time.monotonic() >= deadline:
+                    # CDP-attached browsers can have a different network/proxy
+                    # path from APIRequestContext. Fall back to the browser's
+                    # own authenticated fetch, once, without waiting for the
+                    # entire homepage to render. Never use this on rejection.
+                    payload = self._identity_from_page()
+                    source = 'authenticated_page_fetch'
+                    break
+                write_audit_event(ROOT/'logs/browser-flow.jsonl', 'browser_identity_retry',
+                                  attempt=attempt, recovery='retry_authenticated_read')
+        if source == 'authenticated_context_request':
+            if not response.ok:
+                raise RuntimeError(f'Bilibili identity check HTTP {response.status}')
+            payload = response.json()
+        code = payload.get('code')
+        data = payload.get('data')
+        if code == -101 or (code == 0 and isinstance(data, dict) and data.get('isLogin') is False):
+            write_audit_event(ROOT/'logs/browser-flow.jsonl', 'login_result', logged_in=False)
+            return None
+        if code != 0 or not isinstance(data, dict) or data.get('isLogin') is not True:
+            raise RuntimeError('Bilibili identity response rejected or invalid')
+        mid = data.get('mid')
+        if type(mid) not in (int, str) or not re.fullmatch(r'[1-9][0-9]*', str(mid)):
+            raise RuntimeError('Bilibili identity UID invalid')
+        write_audit_event(ROOT/'logs/browser-flow.jsonl', 'login_result', logged_in=True,
+                          source=source)
+        return str(mid)
+
+    def _identity_from_page(self):
         page = self.page()
         try:
-            page.goto("https://www.bilibili.com/", wait_until="domcontentloaded", timeout=30_000)
-            value = page.evaluate("""() => fetch('https://api.bilibili.com/x/web-interface/nav', {credentials:'include', signal:AbortSignal.timeout(10000)})
-                .then(r=>r.json()).then(x=>x.data?.isLogin ? String(x.data.mid) : null)""")
-            write_audit_event(ROOT/'logs/browser-flow.jsonl', 'login_result', logged_in=bool(value))
-            return value or None
+            with audit_step('browser_identity_page_fallback', 'browser-flow.jsonl'):
+                page.goto('https://www.bilibili.com/', wait_until='commit', timeout=10_000)
+                parsed = urlparse(page.url)
+                if parsed.scheme != 'https' or parsed.hostname != 'www.bilibili.com':
+                    raise RuntimeError('Unexpected identity page target')
+                result = page.locator('html').evaluate("""async () => {
+                  const r = await fetch('https://api.bilibili.com/x/web-interface/nav',
+                    {credentials:'include', signal:AbortSignal.timeout(10000)});
+                  return {ok:r.ok, payload:await r.json()};
+                }""", timeout=15_000)
+                if not isinstance(result, dict) or result.get('ok') is not True:
+                    raise RuntimeError('Bilibili page identity response rejected')
+                return result['payload']
         finally:
-            page.close()
+            try:
+                page.close()
+            except Exception as exc:
+                write_audit_event(ROOT/'logs/browser-flow.jsonl', 'identity_page_cleanup_failed',
+                                  error_type=type(exc).__name__)
 
     @audited('video_search', 'browser-flow.jsonl')
     def search(self, keyword: str, limit: int = 10, *, page_number: int = 1) -> list[Candidate]:

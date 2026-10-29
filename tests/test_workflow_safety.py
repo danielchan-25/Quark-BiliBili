@@ -77,7 +77,7 @@ class WorkflowSafetyTests(unittest.TestCase):
 
     def test_external_history_blocks_both_accounts_even_if_candidate_is_refreshed(self):
         from mediaflow.candidate_pool import eligible_count
-        for uid in ('35199508', '1085803742'):
+        for uid in ('100000001', '100000002'):
             with self.subTest(uid=uid):
                 self.db.connection.execute('DELETE FROM historical_comment_videos')
                 self.db.connection.execute('INSERT INTO historical_comment_videos(bvid,account_uid,source) VALUES(?,?,?)',
@@ -263,6 +263,28 @@ class WorkflowSafetyTests(unittest.TestCase):
         self.assertTrue(self.client.check_comment_editor.call_args.kwargs['retain'])
         self.notify.send_text.assert_not_called()
 
+    def test_visibility_timeout_falls_back_without_globally_disabling_video(self):
+        self.add_fallback_candidates()
+        self.client.video_visible.side_effect = [CommentPreparationError('video_visibility',3,'TimeoutError'), True]
+        candidate = main.available_visible_candidate(self.db,self.client,1,1)
+        self.assertEqual(candidate.bvid,'BVtest2')
+        self.assertEqual(self.db.connection.execute("SELECT status FROM promotion_candidates WHERE bvid='BVtest1'").fetchone()[0],'available')
+        self.assertEqual(self.db.connection.execute("SELECT stage FROM comment_candidate_cooldowns WHERE bvid='BVtest1'").fetchone()[0],'video_visibility')
+        self.client.check_comment_editor.assert_called_once()
+        self.client.publish_comment.assert_not_called()
+        self.assertEqual(self.db.connection.execute('SELECT COUNT(*) FROM promotion_reservations').fetchone()[0],0)
+
+    def test_three_visibility_failures_stop_with_specific_error(self):
+        self.add_fallback_candidates()
+        self.client.video_visible.side_effect = CommentPreparationError('video_visibility',3,'TimeoutError')
+        with self.assertRaises(CommentPreparationError) as caught:
+            main.available_visible_candidate(self.db,self.client,1,1,mutate=False)
+        self.assertEqual(caught.exception.stage,'video_visibility')
+        self.assertEqual(self.client.video_visible.call_count,3)
+        self.client.check_comment_editor.assert_not_called()
+        self.client.publish_comment.assert_not_called()
+        self.assertEqual(self.db.connection.execute('SELECT COUNT(*) FROM comment_candidate_cooldowns').fetchone()[0],0)
+
     def test_cooldown_is_account_specific_expires_and_keeps_video_globally_available(self):
         self.client.check_comment_editor.side_effect = CommentPreparationError('comment_permission',2,'TimeoutError')
         with self.assertRaises(CommentPreparationError):
@@ -272,6 +294,90 @@ class WorkflowSafetyTests(unittest.TestCase):
         self.assertEqual(self.db.connection.execute('SELECT status FROM promotion_candidates').fetchone()[0], 'available')
         self.db.connection.execute("UPDATE comment_candidate_cooldowns SET expires_at=datetime('now','-1 second')")
         self.assertEqual(main.available_candidate(self.db,1,1).bvid,'BVtest1')
+
+    def test_mixed_editor_timeout_and_permission_denials_mark_exhausted_pool_for_refill(self):
+        self.add_fallback_candidates(2)
+        denied = CommentPreparationError('comment_permission', 1, 'CommentUnavailable', 'comments_disabled_by_author')
+        self.client.check_comment_editor.side_effect = [
+            CommentPreparationError('comment_permission', 3, 'TimeoutError'), denied, denied]
+        with self.assertRaises(CommentPreparationError) as caught:
+            main.available_visible_candidate(self.db, self.client, 1, 1)
+        self.assertTrue(caught.exception.selection_exhausted)
+        self.assertTrue(caught.exception.refill_safe)
+        self.assertEqual(caught.exception.candidates_checked, 3)
+        self.client.publish_comment.assert_not_called()
+        self.assertEqual(self.db.connection.execute('SELECT COUNT(*) FROM promotion_reservations').fetchone()[0], 0)
+
+    def test_global_dom_failure_cannot_be_hidden_by_later_candidate_timeout(self):
+        self.add_fallback_candidates(2)
+        self.client.check_comment_editor.side_effect = [
+            CommentPreparationError('dom_probe', 3, 'TimeoutError'),
+            CommentPreparationError('comment_permission', 3, 'TimeoutError'),
+            CommentPreparationError('comment_permission', 3, 'TimeoutError')]
+        with self.assertRaises(CommentPreparationError) as caught:
+            main.available_visible_candidate(self.db, self.client, 1, 1)
+        self.assertTrue(caught.exception.selection_exhausted)
+        self.assertFalse(caught.exception.refill_safe)
+        self.client.publish_comment.assert_not_called()
+
+    def test_native_dom_diagnosis_prevents_exhausted_pool_refill(self):
+        error = CommentPreparationError('comment_permission', 3, 'TimeoutError')
+        error.classification = 'playwright_dom_access_failed_native_responsive'
+        self.client.check_comment_editor.side_effect = error
+        with self.assertRaises(CommentPreparationError) as caught:
+            main.available_visible_candidate(self.db, self.client, 1, 1)
+        self.assertTrue(caught.exception.selection_exhausted)
+        self.assertFalse(caught.exception.refill_safe)
+        self.client.publish_comment.assert_not_called()
+
+    def test_earlier_dom_failure_within_editor_preparation_prevents_refill(self):
+        error = CommentPreparationError('comment_permission', 3, 'TimeoutError')
+        error.failure_classification = 'comment_header_not_rendered'
+        error.failures = [dict(stage='dom_probe', attempt=1, error_type='TimeoutError',
+                               classification='playwright_dom_access_failed_native_responsive'),
+                          dict(stage='comment_permission', attempt=3, error_type='TimeoutError',
+                               classification='comment_header_not_rendered')]
+        self.client.check_comment_editor.side_effect = error
+        with self.assertRaises(CommentPreparationError) as caught:
+            main.available_visible_candidate(self.db, self.client, 1, 1)
+        self.assertTrue(caught.exception.selection_exhausted)
+        self.assertFalse(caught.exception.refill_safe)
+        self.client.publish_comment.assert_not_called()
+
+    def test_global_dom_failure_on_later_denied_video_still_prevents_refill(self):
+        self.add_fallback_candidates(1)
+        denied = CommentPreparationError('comment_permission', 2, 'CommentUnavailable', 'comments_disabled')
+        denied.failures = [dict(stage='dom_probe', attempt=1, error_type='TimeoutError',
+                                classification='playwright_dom_access_failed_native_responsive')]
+        self.client.check_comment_editor.side_effect = [
+            CommentPreparationError('comment_permission', 3, 'TimeoutError'), denied]
+        with self.assertRaises(CommentPreparationError) as caught:
+            main.available_visible_candidate(self.db, self.client, 1, 1)
+        self.assertEqual(caught.exception.error_type, 'TimeoutError')
+        self.assertTrue(caught.exception.selection_exhausted)
+        self.assertFalse(caught.exception.refill_safe)
+        self.client.publish_comment.assert_not_called()
+
+    def test_earlier_dom_probe_timeout_prevents_refill_without_diagnostic_classification(self):
+        error = CommentPreparationError('comment_permission', 3, 'TimeoutError')
+        error.failures = [dict(stage='dom_probe', attempt=1, error_type='TimeoutError')]
+        self.client.check_comment_editor.side_effect = error
+        with self.assertRaises(CommentPreparationError) as caught:
+            main.available_visible_candidate(self.db, self.client, 1, 1)
+        self.assertTrue(caught.exception.selection_exhausted)
+        self.assertFalse(caught.exception.refill_safe)
+        self.client.publish_comment.assert_not_called()
+
+    def test_candidate_failure_limit_does_not_claim_remaining_pool_was_exhausted(self):
+        self.add_fallback_candidates(4)
+        def fail(*args, **kwargs):
+            raise CommentPreparationError('comment_permission', 3, 'TimeoutError')
+        self.client.check_comment_editor.side_effect = fail
+        with self.assertRaises(CommentPreparationError) as caught:
+            main.available_visible_candidate(self.db, self.client, 1, 1)
+        self.assertFalse(getattr(caught.exception, 'selection_exhausted', False))
+        self.assertEqual(self.client.check_comment_editor.call_count, 3)
+        self.client.publish_comment.assert_not_called()
 
     def test_nine_section_timeouts_require_diagnosis_without_submission(self):
         self.add_fallback_candidates()
@@ -348,13 +454,36 @@ class WorkflowSafetyTests(unittest.TestCase):
             self.run_flow(True)
         self.client.uid.assert_not_called()
 
-    def test_daily_limit_stops_before_browser(self):
-        for number in range(5):
-            self.db.connection.execute("""INSERT INTO promotion_records(account_id,platform,video_url,bvid,text,content_hash,publish_status,created_at)
-                VALUES(1,'bilibili',?,?,?,'hash','published',?)""", (str(number), str(number), str(number), main.datetime.now().strftime('%Y-%m-%d 00:00:00')))
-        self.db.connection.commit()
-        self.assertEqual(self.run_flow(True), 1)
-        self.client.uid.assert_not_called()
+    def test_daily_count_no_longer_blocks_preview(self):
+        fixed_now = main.datetime(2026, 10, 24, 12, 0, tzinfo=main.BEIJING)
+        for count in (5, 12):
+            with self.subTest(count=count):
+                self.db.connection.execute('DELETE FROM promotion_records')
+                for number in range(count):
+                    self.db.connection.execute("""INSERT INTO promotion_records(account_id,platform,video_url,bvid,text,content_hash,publish_status,created_at)
+                        VALUES(1,'bilibili',?,?,?,'hash','published',?)""", (str(number), str(number), str(number), '2026-10-24 00:00:00'))
+                self.db.connection.commit()
+                with patch('main.beijing_now', return_value=fixed_now):
+                    self.assertTrue(main.rate_ready(self.db, 1)[0])
+                    self.assertEqual(self.run_flow(True), 0)
+                self.client.uid.assert_called()
+                self.client.publish_comment.assert_not_called()
+
+    def test_interval_still_counts_published_and_unconfirmed_submissions(self):
+        fixed_now = main.datetime(2026, 10, 24, 12, 0, tzinfo=main.BEIJING)
+        for status in ('published', 'submitted'):
+            for seconds, allowed in ((899, False), (900, True), (901, True)):
+                with self.subTest(status=status, seconds=seconds):
+                    self.db.connection.execute('DELETE FROM promotion_records')
+                    created = (fixed_now-main.timedelta(seconds=seconds)).strftime('%Y-%m-%d %H:%M:%S')
+                    self.db.connection.execute("""INSERT INTO promotion_records(account_id,platform,video_url,bvid,text,content_hash,publish_status,created_at)
+                        VALUES(1,'bilibili','old','old','old','hash',?,?)""", (status, created))
+                    with patch('main.beijing_now', return_value=fixed_now):
+                        self.assertEqual(main.rate_ready(self.db, 1)[0], allowed)
+                        if not allowed:
+                            self.assertEqual(self.run_flow(True), 1)
+                    self.client.uid.assert_not_called()
+                    self.client.publish_comment.assert_not_called()
 
     def test_refresh_approved_and_rejected(self):
         from mediaflow.bilibili import Candidate

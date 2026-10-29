@@ -7,7 +7,8 @@ import time
 from mediaflow.bilibili import BilibiliClient
 from mediaflow.audit import write_audit_event, audited
 from mediaflow.config import ROOT
-from mediaflow.scheduled_notifications import scheduled_states, stop_reason, BEIJING
+from mediaflow.scheduled_notifications import scheduled_states, stop_reason
+from mediaflow.time_utils import BEIJING, beijing_now, publication_time
 
 
 @audited('daily_review', 'daily-review.jsonl')
@@ -16,7 +17,8 @@ def daily_review(db, notify, args):
     wait_max = float(os.getenv('REVIEW_WAIT_MAX_SECONDS', '20'))
     if not (math.isfinite(wait_min) and math.isfinite(wait_max) and 1 <= wait_min <= wait_max <= 60):
         raise ValueError('Review wait range must satisfy 1 <= min <= max <= 60 seconds')
-    day = datetime.strptime(args.date, '%Y-%m-%d') if args.date else datetime.now().replace(hour=0,minute=0,second=0,microsecond=0)
+    day = (datetime.strptime(args.date, '%Y-%m-%d').replace(tzinfo=BEIJING) if args.date
+           else beijing_now().replace(hour=0,minute=0,second=0,microsecond=0))
     # promotion_records timestamps are local Beijing time (task_runs are UTC).
     rows = db.connection.execute('''SELECT p.*,a.name,a.uid,a.cdp_url,r.url AS resource_url
         FROM promotion_records p JOIN accounts a ON a.id=p.account_id
@@ -76,7 +78,7 @@ def daily_review(db, notify, args):
     if not rows:
         lines.append('- 当日无留言记录可核验')
     for state in stopped:
-        slot = datetime.fromisoformat(state['slot']).astimezone(BEIJING)
+        slot = publication_time(state['slot'])
         lines.append(f"- {slot:%H:%M} 定时任务：账户={state['account']}，停止或异常，原因={stop_reason(state)}")
     lines.extend(['', f'本次复核：通过 {success}，暂未找到 {len(rows)-success-unavailable}，无法核验 {unavailable}。',
                   '本次复核结果不改变历史发布结果；未找到或无法核验不能据此断言评论已删除。'])

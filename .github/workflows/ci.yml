@@ -1,0 +1,54 @@
+name: Ubuntu verification
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verification-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+      MEDIAFLOW_LOG_DIR: /tmp/quark-bilibili-ci-logs
+      TZ: Asia/Shanghai
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-linux.lock
+      - name: Install pinned project dependencies
+        run: python -m pip install -r requirements-linux.lock
+      - name: Validate shell syntax
+        run: for script in scripts/*.sh; do bash -n "$script"; done
+      - name: Reject private runtime files and credential patterns
+        run: python tools/check_public_tree.py
+      - name: Mocked regression and migration tests
+        run: python -B scripts/test.py
+      - name: Install isolated test browser
+        run: python -m playwright install --with-deps chromium
+      - name: Real local CDP and browser lifecycle smoke test
+        env:
+          MEDIAFLOW_LIVE_TEST: '1'
+          MEDIAFLOW_TEST_NO_SANDBOX: '1'
+        run: python -B scripts/test.py test_linux_live_cdp.py
+      - name: Ensure tests left no private runtime state in the checkout
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          allowed = {'.gitkeep', 'account.example.csv'}
+          unexpected = [str(p) for p in Path('data').iterdir() if p.name not in allowed]
+          assert not unexpected, f'Unexpected checkout runtime data: {unexpected}'
+          assert not Path('.env').exists(), 'Tests must not create a production .env'
+          PY

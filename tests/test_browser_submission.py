@@ -37,6 +37,86 @@ class BrowserSubmissionTests(unittest.TestCase):
         self.page.reload.assert_not_called()
         self.page.keyboard.type.assert_not_called()
 
+    def test_video_visibility_recovers_timeout_without_editor_or_submit(self):
+        self.client.context = MagicMock()
+        response = Mock(ok=True)
+        response.json.return_value = {'code': 0}
+        request = self.client.context.request.get
+        request.side_effect = [PlaywrightTimeoutError('timeout'), response]
+        self.assertTrue(self.client.video_visible('BVtest'))
+        self.assertEqual(request.call_count, 2)
+        self.client.page.assert_not_called()
+
+    def test_visibility_timeout_is_bounded_and_classified(self):
+        self.client.context = MagicMock()
+        self.client.context.request.get.side_effect = PlaywrightTimeoutError('timeout')
+        with self.assertRaises(CommentPreparationError) as caught:
+            self.client.video_visible('BVtest')
+        self.assertEqual(caught.exception.stage, 'video_visibility')
+        self.assertEqual(caught.exception.attempts, 3)
+        self.assertEqual(self.client.context.request.get.call_count, 3)
+
+    def test_visibility_rejection_never_retries(self):
+        self.client.context = MagicMock()
+        response = Mock(ok=True)
+        response.json.return_value = {'code': -412}
+        self.client.context.request.get.return_value = response
+        with self.assertRaises(RuntimeError):
+            self.client.video_visible('BVtest')
+        self.client.context.request.get.assert_called_once()
+
+    def test_identity_uses_browser_session_without_homepage_navigation(self):
+        self.client.context = MagicMock()
+        response = Mock(ok=True)
+        response.json.return_value = {'code': 0, 'data': {'isLogin': True, 'mid': 100000002}}
+        self.client.context.request.get.side_effect = [PlaywrightTimeoutError('timeout'), response]
+        self.assertEqual(self.client.uid(), '100000002')
+        self.assertEqual(self.client.context.request.get.call_count, 2)
+        self.client.page.assert_not_called()
+
+    def test_identity_rejects_malformed_or_denied_response_without_retry(self):
+        for payload in ({'code': -412}, {'code': 0, 'data': {'isLogin': True, 'mid': True}},
+                        {'code': 0, 'data': {'isLogin': True, 'mid': 0}}, {'code': 0}):
+            with self.subTest(payload=payload):
+                self.client.context = MagicMock()
+                response = Mock(ok=True)
+                response.json.return_value = payload
+                self.client.context.request.get.return_value = response
+                with self.assertRaises(RuntimeError):
+                    self.client.uid()
+                self.client.context.request.get.assert_called_once()
+
+    def test_identity_explicit_logout_returns_none(self):
+        for payload in ({'code': -101}, {'code': 0, 'data': {'isLogin': False}}):
+            self.client.context = MagicMock()
+            response = Mock(ok=True)
+            response.json.return_value = payload
+            self.client.context.request.get.return_value = response
+            self.assertIsNone(self.client.uid())
+
+    def test_identity_timeout_has_three_attempt_limit(self):
+        self.client.context = MagicMock()
+        self.client.context.request.get.side_effect = PlaywrightTimeoutError('timeout')
+        self.page.goto.side_effect = PlaywrightTimeoutError('browser network timeout')
+        with self.assertRaises(PlaywrightTimeoutError):
+            self.client.uid()
+        self.assertEqual(self.client.context.request.get.call_count, 3)
+        self.client.page.assert_called_once()
+        self.page.goto.assert_called_once()
+        self.page.close.assert_called_once()
+
+    def test_identity_timeout_falls_back_to_browser_network_with_strict_uid(self):
+        self.client.context = MagicMock()
+        self.client.context.request.get.side_effect = PlaywrightTimeoutError('request channel timeout')
+        self.page.url = 'https://www.bilibili.com/'
+        self.page.locator.return_value.evaluate.return_value = {
+            'ok': True, 'payload': {'code':0, 'data': {'isLogin':True, 'mid':100000002}}}
+        self.assertEqual(self.client.uid(),'100000002')
+        self.page.goto.assert_called_once_with('https://www.bilibili.com/',wait_until='commit',timeout=10_000)
+        self.page.close.assert_called_once()
+        self.page.keyboard.type.assert_not_called()
+        self.page.expect_response.assert_not_called()
+
     def test_completed_api_diagnostics_keep_only_numeric_code(self):
         from mediaflow.bilibili import _PreparationNetworkDiagnostics
         diagnostics = _PreparationNetworkDiagnostics(self.page)
@@ -232,6 +312,20 @@ class BrowserSubmissionTests(unittest.TestCase):
         self.page.goto.side_effect = [PlaywrightTimeoutError('network'), None]
         self.assertEqual(self.client.publish_comment('mock', 'mock'), 'network_confirmed')
         self.page.expect_response.assert_called_once()
+
+    def test_navigation_timeout_probes_runtime_before_repeating_broken_page(self):
+        fresh = MagicMock()
+        self.client.page.side_effect = [self.page, fresh]
+        self.page.goto.side_effect = PlaywrightTimeoutError('navigation stalled')
+        self.client.diagnose_comment_runtime = Mock(return_value={
+            'classification': 'playwright_dom_access_failed_native_responsive'})
+        self.client.check_comment_editor('mock')
+        self.client.diagnose_comment_runtime.assert_called_once()
+        self.page.goto.assert_called_once()
+        self.page.close.assert_called_once()
+        fresh.goto.assert_called_once()
+        fresh.keyboard.type.assert_not_called()
+        fresh.expect_response.assert_not_called()
 
     def test_same_target_retry_reloads_without_typing(self):
         self.page.url = 'https://www.bilibili.com/video/BVtest1/'

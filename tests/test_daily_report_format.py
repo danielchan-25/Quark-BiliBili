@@ -20,7 +20,7 @@ from mediaflow.scheduled_notifications import BEIJING
 
 class GroupedDailyReportTests(unittest.TestCase):
     day = '2026-10-06'
-    accounts = (DEFAULT_ACCOUNT, 'bilibili-1085803742')
+    accounts = (DEFAULT_ACCOUNT, 'bilibili-100000002')
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -76,15 +76,15 @@ class GroupedDailyReportTests(unittest.TestCase):
         self.assertEqual(result['status'], 'sent')
         self.notify.send_text.assert_called_once()
         message = self.notify.send_text.call_args.args[0]
-        self.assertTrue(message.startswith('【Quark-BiliBili】\n2026-10-06\n任务状态：成功7,失败3\n\n账户: 35199508\n'))
+        self.assertTrue(message.startswith('【Quark-BiliBili】\n2026-10-06\n任务状态：成功7,失败3\n\n账户: 100000001\n'))
         self.assertEqual(message.count(',任务成功：'),7)
         self.assertEqual(message.count(',任务失败：'),3)
         self.assertIn('- 00:40,任务失败：（浏览器 CDP 连接不可用',message)
         self.assertIn('- 05:40,任务失败：（候选或文案准备阶段请求超时，TimeoutError）',message)
         self.assertIn('- 10:40,任务成功：https://www.bilibili.com/video/BVvideo10（恢复成功）',message)
         self.assertIn('- 15:40,任务失败：（未找到到期任务的执行记录）',message)
-        self.assertIn('\n\n账户: 1085803742\n- 01:40,任务成功：',message)
-        first_part = message.split('账户: 1085803742')[0]
+        self.assertIn('\n\n账户: 100000002\n- 01:40,任务成功：',message)
+        first_part = message.split('账户: 100000002')[0]
         self.assertEqual([line[2:7] for line in first_part.splitlines() if line.startswith('- ')],
                          ['00:40','05:40','10:40','15:40','20:40'])
         self.assertEqual((result['task_success'], result['task_failed']), (7,3))
@@ -108,7 +108,7 @@ class GroupedDailyReportTests(unittest.TestCase):
         result = self.call()
         self.assertEqual(result['sent_accounts'],[self.accounts[1]])
         message = self.notify.send_text.call_args.args[0]
-        self.assertNotIn('账户: 35199508',message)
+        self.assertNotIn('账户: 100000001',message)
         self.assertIn('任务状态：成功5,失败0',message)
         self.assertEqual(first_receipt,self.receipt(self.accounts[0]).read_bytes())
         self.assertEqual(self.notify.send_text.call_count,2)
@@ -142,7 +142,7 @@ class GroupedDailyReportTests(unittest.TestCase):
         self.assertEqual(result['sent_accounts'],[self.accounts[1]])
         self.assertEqual(result['uncertain_accounts'],[dict(account=self.accounts[0],status='unknown')])
         self.assertEqual(json.loads(path.read_text())['status'],'unknown')
-        self.assertNotIn('账户: 35199508',self.notify.send_text.call_args.args[0])
+        self.assertNotIn('账户: 100000001',self.notify.send_text.call_args.args[0])
         self.notify.send_text.assert_called_once()
 
     def test_preview_does_not_send_construct_a_notifier_or_overwrite_history(self):
@@ -258,6 +258,7 @@ class GroupedDailyReportTests(unittest.TestCase):
         summary = dict(status='sent',date=self.day,account_errors=[dict(account=self.accounts[0],error_type='JSONDecodeError')])
         settings = SimpleNamespace(feishu_webhook='configured',feishu_secret=None)
         with patch('mediaflow.daily_report.daily_report',return_value=summary), \
+             patch('mediaflow.promotion_schedule.require_local_schedule',return_value=(self.accounts[0],{})), \
              patch('mediaflow.config.Settings.load',return_value=settings), \
              patch('mediaflow.config.ROOT',self.root), \
              patch('mediaflow.notify.FeishuNotifier',return_value=self.notify):
@@ -266,6 +267,15 @@ class GroupedDailyReportTests(unittest.TestCase):
         self.notify.send_text.assert_called_once()
         self.assertIn(self.accounts[0],self.notify.send_text.call_args.args[0])
         self.assertNotIn(self.accounts[1],self.notify.send_text.call_args.args[0])
+
+    def test_cli_missing_schedule_never_sends_a_report_or_failure_alert(self):
+        with patch('mediaflow.promotion_schedule.require_local_schedule',side_effect=ValueError('missing')), \
+             patch('mediaflow.daily_report.daily_report') as report, \
+             patch('mediaflow.notify.FeishuNotifier') as notify:
+            result = self.run_cli(['--date',self.day])
+        self.assertEqual(result['reason'],'schedule_configuration_required')
+        report.assert_not_called()
+        notify.assert_not_called()
 
 
 if __name__ == '__main__':

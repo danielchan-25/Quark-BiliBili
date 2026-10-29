@@ -1,0 +1,14 @@
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates bash \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+COPY requirements-linux.lock /app/requirements-linux.lock
+RUN python3 -m venv /opt/test-venv && /opt/test-venv/bin/pip install --no-cache-dir -r requirements-linux.lock \
+    && /opt/test-venv/bin/python -m playwright install --with-deps chromium
+COPY . /app
+RUN useradd --create-home --uid 10001 tester && chown -R tester:tester /app /opt/test-venv
+ENV PATH="/opt/test-venv/bin:$PATH" MEDIAFLOW_LOG_DIR=/tmp/mediaflow-test-logs TZ=Asia/Shanghai
+USER tester
+CMD ["python", "-B", "scripts/test.py"]

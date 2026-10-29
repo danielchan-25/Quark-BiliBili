@@ -127,7 +127,7 @@ def _account_snapshot(connection, account, day, now, states, root):
         activated_at = datetime.fromisoformat(activation['active_from'])
         if activated_at.tzinfo is None:
             raise ValueError('Schedule activation must include timezone')
-    due = [start.replace(hour=hour, minute=40) for hour in ACCOUNT_HOURS.get(account, ACCOUNT_HOURS[DEFAULT_ACCOUNT])
+    due = [start.replace(hour=hour, minute=40) for hour in ACCOUNT_HOURS.get(account, ())
            if start.replace(hour=hour, minute=40) <= now
            and (activated_at is None or start.replace(hour=hour, minute=40) >= activated_at)]
     entries, rounds = {}, []
